@@ -1,12 +1,12 @@
-﻿#define WIN32_LEAN_AND_MEAN             // ���� �� ���� Win32 API ����
-#define _WIN32_WINNT 0x0601   
+﻿#define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0601
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
-#include <xsensdeviceapi.h> // The Xsens device API header
-#include "conio.h"          // For non ANSI _kbhit() and _getch()
+#include <xsensdeviceapi.h>
+#include "conio.h"
 
 #include <string>
 #include <stdexcept>
@@ -16,25 +16,43 @@
 #include <set>
 #include <list>
 #include <utility>
-#include <cmath>            // for math functions (atan2, asin)
+#include <cmath>
 #include <cassert>
 #include <vector>
 
 #include "xsmutex.h"
 #include <xstypes/xstime.h>
 
-extern "C" {
-#include "MadgwickAHRS.h"
-}
-
+#include <glm/glm.hpp>
 
 
 /*! \brief Stream insertion operator overload for XsPortInfo */
-std::ostream& operator << (std::ostream& out, XsPortInfo const & p)
+std::ostream& operator << (std::ostream& out, XsPortInfo const& p)
 {
 	out << "Port: " << std::setw(2) << std::right << p.portNumber() << " (" << p.portName().toStdString() << ") @ "
 		<< std::setw(7) << p.baudrate() << " Bd"
 		<< ", " << "ID: " << p.deviceId().toString().toStdString();
+	return out;
+}
+
+
+static XsVector quatRotate(const XsQuaternion& q, const XsVector& v)
+{
+	// quaternion (w,x,y,z)
+	const double w = q.w(), x = q.x(), y = q.y(), z = q.z();
+	const double vx = v[0], vy = v[1], vz = v[2];
+
+	// q * v  (v 는 순허수 quaternion [0,v])
+	const double ix = w * vx + y * vz - z * vy;
+	const double iy = w * vy + z * vx - x * vz;
+	const double iz = w * vz + x * vy - y * vx;
+	const double iw = -x * vx - y * vy - z * vz;
+
+	// (q * v) * q*   (q* = [w,-x,-y,-z])
+	XsVector out(3);
+	out[0] = ix * w + iw * (-x) + iy * (-z) - iz * (-y);
+	out[1] = iy * w + iw * (-y) + iz * (-x) - ix * (-z);
+	out[2] = iz * w + iw * (-z) + ix * (-y) - iy * (-x);
 	return out;
 }
 
@@ -51,8 +69,43 @@ void sendQuaternionData(SOCKET sock, const std::vector<XsQuaternion>& data)
 	}
 }
 
+bool trySend(SOCKET s, const char* buf, int len)
+{
+	int n = send(s, buf, len, 0);
+	if (n == SOCKET_ERROR)
+	{
+		int e = WSAGetLastError();
+		if (e == WSAEWOULDBLOCK)       // 커널 버퍼가 가득 차 있음 → 프레임 드롭
+			return false;
+		//std::cerr << "send error: " << e << '\n';
+	}
+	return true;
+}
+
+// ── 기존 sendQuaternionData → sendPoseData 로 확장 ─────────────────
+void sendPoseData(
+	SOCKET sock,
+	const std::vector<XsQuaternion>& qVec,
+	const std::vector<glm::vec3>& pVec)
+{
+	for (size_t i = 0; i < qVec.size(); ++i)
+	{
+		float pkt[7] = {
+			static_cast<float>(qVec[i].w()),
+			static_cast<float>(qVec[i].x()),
+			static_cast<float>(qVec[i].y()),
+			static_cast<float>(qVec[i].z()),
+			pVec[i].x, pVec[i].y, pVec[i].z
+		};
+		// ★★★ [PATCH #2]  중복 send 제거 + 논-블로킹 송신 ★★★
+		if (!trySend(sock, reinterpret_cast<char*>(pkt), sizeof(pkt)))
+			break;          // 버퍼가 꽉 차면 이번 프레임 전송 중단
+	}
+}
+
+
 /*! \brief Stream insertion operator overload for XsDevice */
-std::ostream& operator << (std::ostream& out, XsDevice const & d)
+std::ostream& operator << (std::ostream& out, XsDevice const& d)
 {
 	out << "ID: " << d.deviceId().toString().toStdString() << " (" << d.productCode().toStdString() << ")";
 	return out;
@@ -86,23 +139,25 @@ int findClosestUpdateRate(const XsIntArray& supportedUpdateRates, const int desi
 	return closestUpdateRate;
 }
 
-// \brief Convert a quaternion to Euler angles (roll, pitch, yaw) in radians
-
+/*! \brief Convert a quaternion to Euler angles (roll, pitch, yaw) in radians
+ *  좌표계에 따라 변환 방식이 다를 수 있으므로, 실제 적용 시 테스트 후 보정하십시오.
+ */
 void quaternionToEuler(const XsQuaternion& qs, double& roll, double& pitch, double& yaw)
 {
-    double w = qs.w();
-    double x = qs.x();
-    double y = qs.y();
-    double z = qs.z();
+	// 쿼터니언 성분 추출
+	double w = qs.w();
+	double x = qs.x();
+	double y = qs.y();
+	double z = qs.z();
 
-    // Roll (x-axis rotation)
-    roll = std::atan2(2.0 * (w * x + y * z), 1 - 2.0 * (x * x + y * y));
+	// Roll (x-axis rotation)
+	roll = std::atan2(2.0 * (w * x + y * z), 1 - 2.0 * (x * x + y * y));
 
-    // Pitch (y-axis rotation)
-    pitch = std::asin(2.0 * (w * y - z * x));
+	// Pitch (y-axis rotation)
+	pitch = std::asin(2.0 * (w * y - z * x));
 
-    // Yaw (z-axis rotation)
-    yaw = std::atan2(2.0 * (w * z + x * y), 1 - 2.0 * (y * y + z * z));
+	// Yaw (z-axis rotation)
+	yaw = std::atan2(2.0 * (w * z + x * y), 1 - 2.0 * (y * y + z * z));
 }
 
 //----------------------------------------------------------------------
@@ -172,7 +227,8 @@ public:
 	MtwCallback(int mtwIndex, XsDevice* device)
 		: m_mtwIndex(mtwIndex)
 		, m_device(device)
-	{}
+	{
+	}
 
 	bool dataAvailable() const
 	{
@@ -180,10 +236,10 @@ public:
 		return !m_packetBuffer.empty();
 	}
 
-	XsDataPacket const * getOldestPacket() const
+	XsDataPacket const* getOldestPacket() const
 	{
 		XsMutexLocker lock(m_mutex);
-		XsDataPacket const * packet = &m_packetBuffer.front();
+		XsDataPacket const* packet = &m_packetBuffer.front();
 		return packet;
 	}
 
@@ -193,12 +249,22 @@ public:
 		m_packetBuffer.pop_front();
 	}
 
+	XsDataPacket const* getLatestPacket() const {
+		XsMutexLocker lock(m_mutex);
+		return &m_packetBuffer.back();
+	}
+
+	void clearPackets() {
+		XsMutexLocker lock(m_mutex);
+		m_packetBuffer.clear();
+	}
+
 	int getMtwIndex() const
 	{
 		return m_mtwIndex;
 	}
 
-	XsDevice const & device() const
+	XsDevice const& device() const
 	{
 		assert(m_device != 0);
 		return *m_device;
@@ -234,14 +300,6 @@ int main(int argc, char* argv[])
 	(void)argv;
 	const int desiredUpdateRate = 75;	// Use 75 Hz update rate for MTWs
 	const int desiredRadioChannel = 19;	// Use radio channel 19 for wireless master.
-
-	struct FilterState
-	{
-		float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
-		float beta = 0.1f;                // 가중치(필요하면 센서마다 따로 조절)
-	};
-
-	std::vector<FilterState> states;
 
 	WirelessMasterCallback wirelessMasterCallback; // Callback for wireless master
 	std::vector<MtwCallback*> mtwCallbacks; // Callbacks for MTW devices
@@ -310,8 +368,7 @@ int main(int argc, char* argv[])
 		}
 		std::cout << std::endl;
 
-		//const int newUpdateRate = findClosestUpdateRate(supportedUpdateRates, desiredUpdateRate);
-		const int newUpdateRate = 40;
+		const int newUpdateRate = findClosestUpdateRate(supportedUpdateRates, desiredUpdateRate);
 
 		std::cout << "Setting update rate to " << newUpdateRate << " Hz..." << std::endl;
 		if (!wirelessMasterDevice->setUpdateRate(newUpdateRate))
@@ -348,24 +405,44 @@ int main(int argc, char* argv[])
 			return -1;
 		}
 
+		// 2) 서버(파이썬) 소켓 생성 & 연결
 		SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (sock == INVALID_SOCKET) {
-			std::cerr << "Socket: " << WSAGetLastError() << std::endl;
+			std::cerr << "Socket 생성 실패: " << WSAGetLastError() << std::endl;
 			WSACleanup();
 			return -1;
 		}
+		{
+			u_long nb = 1;
+			ioctlsocket(sock, FIONBIO, &nb);
+			// (선택) 버퍼 키우기 → 블로킹 확률 더 줄이고 싶으면 사용
+			// int sz = 256*1024;
+			// setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sz, sizeof(sz));
+		}
+
+		// 3) Nagle 끄기
+		BOOL flag = TRUE;
+		setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+
+		// 4) 서버 주소
 		sockaddr_in servAddr{};
 		servAddr.sin_family = AF_INET;
 		servAddr.sin_port = htons(65431);
 		InetPtonA(AF_INET, "127.0.0.1", &servAddr.sin_addr);
 
+		// 5) 연결
 		if (connect(sock, (sockaddr*)&servAddr, sizeof(servAddr)) == SOCKET_ERROR) {
-			std::cerr << "Connected to: " << WSAGetLastError() << std::endl;
-			closesocket(sock);
-			WSACleanup();
-			return -1;
+			int e = WSAGetLastError();
+			if (e != WSAEWOULDBLOCK && e != WSAEINPROGRESS) {   // 즉시 실패 케이스
+				std::cerr << "Connect 실패: " << e << '\n';
+				closesocket(sock); WSACleanup();
+				return -1;
+			}
+			// 논-블로킹 connect는 이후 select()/WSAPoll() 로 완료 확인해도 되지만
+			// 예제에선 로컬 loopback이므로 잠시 sleep 후 사용.
+			Sleep(100);   // 0.1초 대기
 		}
-		std::cout << "(127.0.0.1:65431)" << std::endl;
+		std::cout << "→ Python 서버와 연결됨 (127.0.0.1:65431)\n";
 
 		bool waitForConnections = true;
 		size_t connectedMTWCount = wirelessMasterCallback.getWirelessMTWs().size();
@@ -390,8 +467,7 @@ int main(int argc, char* argv[])
 			{
 				waitForConnections = (toupper((char)_getch()) != 'Y');
 			}
-		}
-		while (waitForConnections);
+		} while (waitForConnections);
 
 		std::cout << "Starting measurement..." << std::endl;
 		if (!wirelessMasterDevice->gotoMeasurement())
@@ -433,95 +509,92 @@ int main(int argc, char* argv[])
 			mtwDevices[i]->addCallbackHandler(mtwCallbacks[i]);
 		}
 
-		states.resize(mtwCallbacks.size());
-
 		std::cout << "\nMain loop. Press any key to quit\n" << std::endl;
 		std::cout << "Waiting for data available..." << std::endl;
 
 		std::vector<XsQuaternion> quaternionData(mtwCallbacks.size()); // Room to store quaternion data for each MTW
+		std::vector<XsVector> accelerationData(mtwCallbacks.size());
 		unsigned int printCounter = 0;
-		
-		while (!_kbhit())
-		{
+
+		// ───── (1) 준비부 ─────────────────────────────────────────────────────
+		const double dtFixed = 1.0 / newUpdateRate;            // 75 Hz = 0.0133 s ★★★
+		const glm::vec3 g(0.0f, 0.0f, 9.81f);                  // 중력벡터 (world) ★★★
+
+		// 센서마다 속도·위치 초기화 ★★★
+		std::vector<glm::vec3> vel(mtwCallbacks.size(), glm::vec3(0.0f));
+		std::vector<glm::vec3> pos(mtwCallbacks.size(), glm::vec3(0.0f));
+		constexpr size_t POS_SENSOR = 0;
+
+		while (!_kbhit()) {
 			XsTime::msleep(0);
 
-			bool newDataAvailable = false;
+			bool newData = false;
 
-			for (size_t i = 0; i < mtwCallbacks.size(); ++i)
-			{
-				if (!mtwCallbacks[i]->dataAvailable())
-					continue;
+			// 1) 최신 패킷 수집
+			for (size_t i = 0; i < mtwCallbacks.size(); ++i) {
+				if (!mtwCallbacks[i]->dataAvailable()) continue;
 
-				newDataAvailable = true;
-				const XsDataPacket* packet = mtwCallbacks[i]->getOldestPacket();
-
-				/* 1) 원시 센서 값 추출 */
-				XsVector a = packet->calibratedAcceleration();     // ax, ay, az  [g]
-				XsVector g = packet->calibratedGyroscopeData();    // gx, gy, gz  [rad/s]
-				XsVector m = packet->calibratedMagneticField();    // mx, my, mz  [µT]
-
-				/* 2) 자신의 필터 상태 로드 → 전역 변수로 복사 */
-				FilterState& st = states[i];
-				q0 = st.q0;  q1 = st.q1;  q2 = st.q2;  q3 = st.q3;
-				beta = st.beta;
-
-				/* 3) Madgwick 한 번 돌리기 */
-				MadgwickAHRSupdate(
-					(float)g[0], (float)g[1], (float)g[2],
-					(float)a[0], (float)a[1], (float)a[2],
-					(float)m[0], (float)m[1], (float)m[2]);
-
-				/* 4) 다시 버퍼에 저장 */
-				st.q0 = q0;  st.q1 = q1;  st.q2 = q2;  st.q3 = q3;  st.beta = beta;
-
-				/* 5) 네트워크/로그용 벡터에 담기 */
-				quaternionData[i] = XsQuaternion(q0, q1, q2, q3);
-
-				mtwCallbacks[i]->deleteOldestPacket();
+				newData = true;
+				const XsDataPacket* packet = mtwCallbacks[i]->getLatestPacket();
+				quaternionData[i] = packet->orientationQuaternion();
+				accelerationData[i] = packet->calibratedAcceleration();
+				mtwCallbacks[i]->clearPackets();
+				//std::cout << "asd" << std::endl;
 			}
 
-			/*  새 데이터가 하나라도 있으면 송신 */
-			if (newDataAvailable)
-			{
-				if (printCounter % 1 == 0)
-				{
-					/* 필요하면 여기서 로컬 프린트 */
+			if (newData) {
+					size_t i = POS_SENSOR;
+					XsVector accW_xs = quatRotate(quaternionData[i], accelerationData[i]);
+					glm::vec3 accW(accW_xs[0], accW_xs[1], accW_xs[2]);
+
+					glm::vec3 accLin = accW - g;
+					vel[i] += accLin * static_cast<float>(dtFixed);
+
+					// ZUPT
+					if (glm::length(accLin) < 0.3f)
+						vel[i] = glm::vec3(0.0f);
+
+					pos[i] += vel[i] * static_cast<float>(dtFixed);
 				}
-				sendQuaternionData(sock, quaternionData);
-				++printCounter;
+
+				// 나머지 센서는 위치 0으로(또는 이전 값 유지하고 싶으면 이 블록 삭제)
+				for (size_t i = 0; i < mtwCallbacks.size(); ++i) {
+					if (i == POS_SENSOR) continue;
+					pos[i] = glm::vec3(0.0f);
+				}
+				// 5) 송신 (논블로킹, 버퍼 꽉 차면 프레임 드롭하고 계속)
+				sendPoseData(sock, quaternionData, pos);
 			}
-		}
-		(void)_getch();
 
-		std::cout << "Setting config mode..." << std::endl;
-		if (!wirelessMasterDevice->gotoConfig())
+			// ───── 루프 종료 후 정리(여기서만 종료) ─────────────────────────────
+			std::cout << "Stopping measurement..." << std::endl;
+
+			std::cout << "Setting config mode..." << std::endl;
+			if (!wirelessMasterDevice->gotoConfig()) {
+				std::ostringstream error;
+				error << "Failed to goto config mode: " << *wirelessMasterDevice;
+				throw std::runtime_error(error.str());
+			}
+
+			std::cout << "Disabling radio... " << std::endl;
+			if (!wirelessMasterDevice->disableRadio()) {
+				std::ostringstream error;
+				error << "Failed to disable radio: " << *wirelessMasterDevice;
+				throw std::runtime_error(error.str());
+			}
+			closesocket(sock);
+			WSACleanup();
+		}
+	catch (std::exception const& ex)
 		{
-			std::ostringstream error;
-			error << "Failed to goto config mode: " << *wirelessMasterDevice;
-			throw std::runtime_error(error.str());
+			std::cout << ex.what() << std::endl;
+			std::cout << "****ABORT****" << std::endl;
 		}
-
-		std::cout << "Disabling radio... " << std::endl;
-		if (!wirelessMasterDevice->disableRadio())
-		{
-			std::ostringstream error;
-			error << "Failed to disable radio: " << *wirelessMasterDevice;
-			throw std::runtime_error(error.str());
-		}
-
-		closesocket(sock);
-		WSACleanup();
-	}
-	catch (std::exception const & ex)
-	{
-		std::cout << ex.what() << std::endl;
-		std::cout << "****ABORT****" << std::endl;
-	}
 	catch (...)
-	{
-		std::cout << "An unknown fatal error has occured. Aborting." << std::endl;
-		std::cout << "****ABORT****" << std::endl;
-	}
+		{
+			std::cout << "An unknown fatal error has occured. Aborting." << std::endl;
+			std::cout << "****ABORT****" << std::endl;
+		}
 
 	std::cout << "Closing XsControl..." << std::endl;
 	control->close();
@@ -535,8 +608,5 @@ int main(int argc, char* argv[])
 	std::cout << "Successful exit." << std::endl;
 	std::cout << "Press [ENTER] to continue." << std::endl; std::cin.get();
 
-
 	return 0;
 }
-
-
