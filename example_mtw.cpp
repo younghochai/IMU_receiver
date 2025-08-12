@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cassert>
 #include <vector>
+#include <array>
 
 #include "xsmutex.h"
 #include <xstypes/xstime.h>
@@ -35,6 +36,12 @@ std::ostream& operator << (std::ostream& out, XsPortInfo const& p)
 	return out;
 }
 
+static void debugPrintPose(size_t idx, const XsQuaternion& q, const glm::vec3& p) {
+	std::cout.setf(std::ios::fixed);
+	std::cout << std::setprecision(4)
+		<< "[MTW " << idx << "] q=(" << q.w() << "," << q.x() << "," << q.y() << "," << q.z() << ") "
+		<< "p=(" << p.x << "," << p.y << "," << p.z << ")\n";
+}
 
 static XsVector quatRotate(const XsQuaternion& q, const XsVector& v)
 {
@@ -82,26 +89,33 @@ bool trySend(SOCKET s, const char* buf, int len)
 	return true;
 }
 
-// ── 기존 sendQuaternionData → sendPoseData 로 확장 ─────────────────
 void sendPoseData(
 	SOCKET sock,
 	const std::vector<XsQuaternion>& qVec,
 	const std::vector<glm::vec3>& pVec)
 {
-	for (size_t i = 0; i < qVec.size(); ++i)
-	{
-		float pkt[7] = {
-			static_cast<float>(qVec[i].w()),
-			static_cast<float>(qVec[i].x()),
-			static_cast<float>(qVec[i].y()),
-			static_cast<float>(qVec[i].z()),
-			pVec[i].x, pVec[i].y, pVec[i].z
-		};
-		// ★★★ [PATCH #2]  중복 send 제거 + 논-블로킹 송신 ★★★
-		if (!trySend(sock, reinterpret_cast<char*>(pkt), sizeof(pkt)))
-			break;          // 버퍼가 꽉 차면 이번 프레임 전송 중단
+	constexpr size_t SENSOR_COUNT = 7;
+	constexpr size_t FPS = 7; // qw,qx,qy,qz,px,py,pz
+	std::array<float, SENSOR_COUNT* FPS> frame{};      // 49 floats = 196B
+
+	// 기본 패딩: 단위쿼터니언
+	for (size_t s = 0; s < SENSOR_COUNT; ++s) frame[s * FPS + 0] = 1.0f;
+
+	const size_t N = std::min(qVec.size(), (size_t)SENSOR_COUNT);
+	for (size_t i = 0; i < N; ++i) {
+		frame[i * FPS + 0] = (float)qVec[i].w();
+		frame[i * FPS + 1] = (float)qVec[i].x();
+		frame[i * FPS + 2] = (float)qVec[i].y();
+		frame[i * FPS + 3] = (float)qVec[i].z();
+		frame[i * FPS + 4] = pVec[i].x; frame[i * FPS + 5] = pVec[i].y; frame[i * FPS + 6] = pVec[i].z;
+	}
+
+	const int bytes = (int)(frame.size() * sizeof(float));
+	if (!trySend(sock, reinterpret_cast<const char*>(frame.data()), bytes)) {
+		return; // 버퍼 꽉 차면 이번 프레임 통째로 스킵 (부분전송 금지)
 	}
 }
+
 
 
 /*! \brief Stream insertion operator overload for XsDevice */
@@ -514,7 +528,9 @@ int main(int argc, char* argv[])
 
 		std::vector<XsQuaternion> quaternionData(mtwCallbacks.size()); // Room to store quaternion data for each MTW
 		std::vector<XsVector> accelerationData(mtwCallbacks.size());
-		unsigned int printCounter = 0;
+		//unsigned int printCounter = 0;
+		static unsigned long frame = 0;
+		constexpr unsigned PRINT_EVERY = 300; // 10프레임마다
 
 		// ───── (1) 준비부 ─────────────────────────────────────────────────────
 		const double dtFixed = 1.0 / newUpdateRate;            // 75 Hz = 0.0133 s ★★★
@@ -537,7 +553,8 @@ int main(int argc, char* argv[])
 				newData = true;
 				const XsDataPacket* packet = mtwCallbacks[i]->getLatestPacket();
 				quaternionData[i] = packet->orientationQuaternion();
-				accelerationData[i] = packet->calibratedAcceleration();
+				//accelerationData[i] = packet->calibratedAcceleration();
+				accelerationData[i] = packet->freeAcceleration();
 				mtwCallbacks[i]->clearPackets();
 				//std::cout << "asd" << std::endl;
 			}
@@ -547,7 +564,8 @@ int main(int argc, char* argv[])
 					XsVector accW_xs = quatRotate(quaternionData[i], accelerationData[i]);
 					glm::vec3 accW(accW_xs[0], accW_xs[1], accW_xs[2]);
 
-					glm::vec3 accLin = accW - g;
+					//glm::vec3 accLin = accW - g;
+					glm::vec3 accLin = accW;
 					vel[i] += accLin * static_cast<float>(dtFixed);
 
 					// ZUPT
@@ -562,9 +580,17 @@ int main(int argc, char* argv[])
 					if (i == POS_SENSOR) continue;
 					pos[i] = glm::vec3(0.0f);
 				}
+				if ((frame % PRINT_EVERY) == 0) {
+					for (size_t i = 0; i < quaternionData.size(); ++i)
+						debugPrintPose(i, quaternionData[i], pos[i]);
+				}
+				frame++;
 				// 5) 송신 (논블로킹, 버퍼 꽉 차면 프레임 드롭하고 계속)
 				sendPoseData(sock, quaternionData, pos);
+				//std::cout << "send !" << std::endl;
 			}
+			
+
 
 			// ───── 루프 종료 후 정리(여기서만 종료) ─────────────────────────────
 			std::cout << "Stopping measurement..." << std::endl;
