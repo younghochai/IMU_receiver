@@ -530,7 +530,7 @@ int main(int argc, char* argv[])
 		std::vector<XsVector> accelerationData(mtwCallbacks.size());
 		//unsigned int printCounter = 0;
 		static unsigned long frame = 0;
-		constexpr unsigned PRINT_EVERY = 300; // 10프레임마다
+		constexpr unsigned PRINT_EVERY = 1800; // 
 
 		// ───── (1) 준비부 ─────────────────────────────────────────────────────
 		const double dtFixed = 1.0 / newUpdateRate;            // 75 Hz = 0.0133 s ★★★
