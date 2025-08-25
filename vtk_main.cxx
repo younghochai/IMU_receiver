@@ -19,6 +19,10 @@
 #include <vtkCommand.h>
 #include <filesystem>
 
+#include <vtkImageCanvasSource2D.h>
+#include <vtkTexture.h>
+#include <vtkTransformTextureCoords.h>
+
 #include <array>
 #include <vector>
 #include <thread>
@@ -32,8 +36,17 @@
 #include <cstdio>
 #include <cstring>
 
+
 // GLM (header‑only) for vec3 ----------------------------------------------
 #include <glm/glm.hpp>
+
+// === floor clamp config ===
+constexpr double kFloorY = -49.0;  // 바닥 높이(기존 floorY와 통일)
+constexpr double kClampTol = 1e-3;   // 수치 떨림 방지용 아주 작은 여유
+
+std::atomic<double> gLeftFootBottomY{ kFloorY };
+std::atomic<double> gRightFootBottomY{ kFloorY };
+
 
 namespace fs = std::filesystem;
 
@@ -51,6 +64,14 @@ constexpr int          kTimerIntervalMs = 10; // VTK timer period (10 ms)
 
 /* ===============================  TYPES  ================================= */
 struct Quaternion { double w{ 1 }, x{ 0 }, y{ 0 }, z{ 0 }; };
+
+// 스탠스 앵커 상태
+struct PlantState {
+    bool planted{ false };
+    glm::vec3 anchorPos{ 0.0f, (float)kFloorY, 0.0f }; // 발바닥 접지점
+    double anchorYaw{ 0.0 }; // (선택) 발 yaw 고정용
+};
+PlantState gPlantL, gPlantR;
 
 enum class SensorIndex : int {
     PELVIS = 0, LEFT_LEG, LEFT_CALF, LEFT_FOOT,
@@ -298,6 +319,7 @@ public:
         }
 
         auto Mq = quatToMatrix({ adj.w, adj.y, adj.z, adj.x });
+        //auto Mq = quatToMatrix({ adj.w, adj.x, adj.y, adj.z });
         vtkNew<vtkMatrix4x4> Q;
         Q->DeepCopy(Mq.data());
 
@@ -307,9 +329,13 @@ public:
         if (mSensorIdx == static_cast<int>(SensorIndex::PELVIS)) {
             // PELVIS: 절대 위치 + 중심 회전
             glm::vec3 offset;
+            constexpr double kMetersToVtk = 10.0;
+
             { std::lock_guard lk(gMutex); offset = gPosOffset; }
             auto p = pos + offset;
-            mTransform->Translate(p.x, p.y, p.z);
+            // mTransform->Translate(p.x, p.y, p.z);
+            // mTransform->Concatenate(Q);
+            mTransform->Translate(p.x, p.z, p.y * kMetersToVtk); //★★★
             mTransform->Concatenate(Q);
         }
         else {
@@ -344,7 +370,78 @@ public:
             gSensorLog.emplace_back(std::move(row));
         }
 
+        // ----- (A) 발 최저점 기록 -----
+        if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT) ||
+            mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
+            double b[6];
+            // mActor는 이 콜백이 담당하는 액터(왼발/오른발/기타)임
+            mActor->GetBounds(b);           // b = [xmin, xmax, ymin, ymax, zmin, zmax] (월드 좌표)
+            double bottomY = b[2];          // ymin = 최저점 Y
+            if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT))
+                gLeftFootBottomY.store(bottomY, std::memory_order_relaxed);
+            else
+                gRightFootBottomY.store(bottomY, std::memory_order_relaxed);
+        }
+
+        // ----- (B) 오른발 콜백이 마지막에 불리도록 등록돼 있으므로 여기서 한 번만 보정 -----
+        if (mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
+            double minBottom = std::min(gLeftFootBottomY.load(std::memory_order_relaxed),
+                gRightFootBottomY.load(std::memory_order_relaxed));
+
+            if (minBottom + kClampTol < kFloorY) {
+                double delta = kFloorY - minBottom;   // 바닥까지 올려야 하는 양
+                // 골반 기준 오프셋을 올리면 자식(무릎/발목/발) 전부 같이 올라감
+                std::lock_guard lk(gMutex);
+                gPosOffset.z += static_cast<float>(delta); //★★★ y->z
+            }
+        } // 
+
+        // --- (A) 이 콜백 액터가 발이면, 월드 최저점(ymin)을 기록 ---
+        if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT) ||
+            mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
+            double b[6];
+            mActor->GetBounds(b);         // [xmin, xmax, ymin, ymax, zmin, zmax] in world
+            double bottomY = b[2];        // ymin = 발바닥 최저점
+            if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT))
+                gLeftFootBottomY.store(bottomY, std::memory_order_relaxed);
+            else
+                gRightFootBottomY.store(bottomY, std::memory_order_relaxed);
+        }
+
+        // --- (B) 프레임당 1번: 오른발 콜백에서 전신 오프셋 보정 수행 ---
+        // 등록 순서가 PELVIS → ... → LEFT_FOOT → ... → RIGHT_FOOT 이므로
+        // RIGHT_FOOT가 마지막이라고 가정(현재 main 등록 순서 그대로라면 OK)
+        if (mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
+            const double leftB = gLeftFootBottomY.load(std::memory_order_relaxed);
+            const double rightB = gRightFootBottomY.load(std::memory_order_relaxed);
+            const double minBottom = std::min(leftB, rightB);
+
+            // 목표: minBottom == kFloorY (한 발은 반드시 바닥에 닿게)
+            double delta = 0.0;
+            if (minBottom < kFloorY - kClampTol) {
+                // 뚫림: 위로 올림
+                delta = kFloorY - minBottom;  // +값
+            }
+            else if (minBottom > kFloorY + kClampTol) {
+                // 공중부양: 아래로 내림
+                delta = kFloorY - minBottom;  // -값
+            }
+
+            if (std::abs(delta) > 0.0) {
+                std::lock_guard lk(gMutex);
+                // 전신(골반 상위) 오프셋에 반영 → 다음 프레임부터 즉시 적용
+                gPosOffset.z += static_cast<float>(delta);
+
+                // (선택) 프레임당 이동량 제한으로 급격한 튐 방지
+                // const double kMaxStep = 5.0; // 필요시 사용
+                // gPosOffset.y += static_cast<float>(std::clamp(delta, -kMaxStep, kMaxStep));
+            }
+        }
+
+
         if (mSensorIdx == 0) mRenWin->Render();
+
+
     }
 
 private:
@@ -424,12 +521,46 @@ int main() {
     iren->SetRenderWindow(renderWin);
 
     /* --- floor grid setup --- */
+
+
     auto plane = vtkSmartPointer<vtkPlaneSource>::New();
-    int floorY = -49;
-    plane->SetOrigin(-500, floorY, -500);
-    plane->SetPoint1(500, floorY, -500);
-    plane->SetPoint2(-500, floorY, 500);
+    //int floorY = -49;
+    plane->SetOrigin(-1000, kFloorY, -1000);
+    plane->SetPoint1(1000, kFloorY, -1000);
+    plane->SetPoint2(-1000, kFloorY, 1000);
     plane->SetXResolution(10); plane->SetYResolution(10); plane->Update();
+
+    // 1) 체커 이미지 생성 (프로시저럴)
+    int texSize = 1024;      // 텍스처 해상도
+    int tilePx = 512;        // 한 칸 픽셀 크기
+    auto checker = vtkSmartPointer<vtkImageCanvasSource2D>::New();
+    checker->SetExtent(0, texSize - 1, 0, texSize - 1, 0, 0);
+    checker->SetNumberOfScalarComponents(3);
+    checker->SetScalarTypeToUnsignedChar();
+    for (int y = 0; y < texSize; y += tilePx) {
+        for (int x = 0; x < texSize; x += tilePx) {
+            bool dark = ((x / tilePx + y / tilePx) % 2) == 0;
+            // 칸 색상(밝기 튜닝 가능)
+            if (dark) checker->SetDrawColor(60, 60, 60);
+            else      checker->SetDrawColor(200, 200, 200);
+            checker->FillBox(x, x + tilePx - 1, y, y + tilePx - 1);
+        }
+    }
+
+    // 2) UV 스케일(바닥 면적 대비 몇 번 반복할지)
+    auto tcX = 20.0;  // X 방향 반복 횟수
+    auto tcY = 20.0;  // Y 방향 반복 횟수
+    auto tcoordsXform = vtkSmartPointer<vtkTransformTextureCoords>::New();
+    tcoordsXform->SetInputConnection(plane->GetOutputPort()); // 기존 plane 사용
+    tcoordsXform->SetScale(tcX, tcY, 1);
+
+    // 3) 텍스처 객체 생성 및 적용
+    auto tex = vtkSmartPointer<vtkTexture>::New();
+    tex->SetInputConnection(checker->GetOutputPort());
+    tex->InterpolateOff();  // 픽셀 또렷하게
+    tex->RepeatOn();        // UV 반복 허용
+
+    
 
     auto floorMapper = vtkSmartPointer<vtkPolyDataMapper>::New();
     floorMapper->SetInputConnection(plane->GetOutputPort());
@@ -448,6 +579,10 @@ int main() {
     floorGrid->GetProperty()->SetColor(0.3, 0.3, 0.3);
     floorGrid->GetProperty()->SetLineWidth(1.0); floorGrid->GetProperty()->LightingOff(); floorGrid->PickableOff();
     renderer->AddActor(floorSurface); renderer->AddActor(floorGrid);
+
+    floorMapper->SetInputConnection(tcoordsXform->GetOutputPort()); // ← 중요
+    floorSurface->SetTexture(tex);
+    floorSurface->GetProperty()->SetColor(1, 1, 1); // 텍스처 보이도록 흰색
 
     // camera
     auto cam = renderer->GetActiveCamera();
