@@ -35,6 +35,7 @@
 #include <string>
 #include <cstdio>
 #include <cstring>
+#include <algorithm> // std::clamp
 
 
 // GLM (header‑only) for vec3 ----------------------------------------------
@@ -46,6 +47,46 @@ constexpr double kClampTol = 1e-3;   // 수치 떨림 방지용 아주 작은 �
 
 std::atomic<double> gLeftFootBottomY{ kFloorY };
 std::atomic<double> gRightFootBottomY{ kFloorY };
+
+std::atomic<double> gLeftFootMidX{ 0 }, gLeftFootMidZ{ 0 };
+std::atomic<double> gRightFootMidX{ 0 }, gRightFootMidZ{ 0 };
+
+constexpr double kContactYTol = 0.8;   // 바닥과의 Y 거리 허용치
+constexpr double kLiftYExit = 1.5;   // 접지 해제(리프트) 문턱
+constexpr double kVelTolPerFrame = 0.06;  // 프레임당 수직 이동 허용치(10ms 타이머 기준)
+constexpr double kDeadXY = 0.30;  // XY 데드존(사소한 미끄러짐 무시)
+constexpr double kLockGain = 0.60;  // 보정 게인(0~1)
+constexpr double kMaxStepXY = 1.20;  // 프레임당 최대 보정 스텝(과도 스냅 방지)
+
+// === v=0(속도-락) 보정 파라미터 ===
+constexpr int kTimerIntervalMs = 10;
+constexpr double kDt = kTimerIntervalMs * 0.001; // 컴파일 타임 계산됨
+constexpr double kVelLpfAlpha = 0.25;   // 속도 저역통과(0~1) 클수록 민감
+constexpr double kVelCancelGain = 0.40;   // v=0 수렴 게인(0~1)
+constexpr double kMaxVelCancelStep = 1.8;    // 프레임당 최대 보정 스텝( VTK 단위 )
+
+
+// 접지 디바운스/히스테리시스 & 램프
+constexpr int    kTouchHoldFrames = 3;   // 접지로 바꾸려면 N프레임 연속 touching이어야 함
+constexpr int    kReleaseHoldFrames = 2;   // 접지 해제도 N프레임 연속 떨어져 있어야 함
+constexpr int    kLockRampFrames = 6;   // 접지 직후 풋락 게인 램프-업 기간(프레임 단위)
+constexpr float kAnchorAlpha = 0.35;// 앵커 스무딩(0=이전 유지, 1=즉시 스냅)
+
+// 수직 클램프 1프레임 최대 보정(팝 방지)
+constexpr double kMaxYClampStep = 0.8; // VTK Y 단위
+
+// ★ 추가: 현재 발바닥의 월드 XZ 캐시(보정에 사용)
+std::atomic<double> gLeftFootX{ 0.0 }, gLeftFootZ{ 0.0 };
+std::atomic<double> gRightFootX{ 0.0 }, gRightFootZ{ 0.0 };
+
+// 발바닥 월드 XZ 이전값(속도 추정용)
+std::atomic<double> gPrevLeftX{0.0},  gPrevLeftZ{0.0};
+std::atomic<double> gPrevRightX{0.0}, gPrevRightZ{0.0};
+std::atomic_bool    gPrevLeftValid{false}, gPrevRightValid{false};
+
+// 저역통과된 평면 속도( VTK 단위: X,Z / 초 )
+std::atomic<double> gFiltLeftVX{0.0},  gFiltLeftVZ{0.0};
+std::atomic<double> gFiltRightVX{0.0}, gFiltRightVZ{0.0};
 
 
 namespace fs = std::filesystem;
@@ -60,7 +101,7 @@ namespace fs = std::filesystem;
 constexpr const char* kHost = "127.0.0.1";
 constexpr uint16_t     kPort = 65431;
 constexpr int          kSensorCount = 7;      // 7 IMUs
-constexpr int          kTimerIntervalMs = 10; // VTK timer period (10 ms)
+//constexpr int          kTimerIntervalMs = 10; // VTK timer period (10 ms)
 
 /* ===============================  TYPES  ================================= */
 struct Quaternion { double w{ 1 }, x{ 0 }, y{ 0 }, z{ 0 }; };
@@ -68,8 +109,15 @@ struct Quaternion { double w{ 1 }, x{ 0 }, y{ 0 }, z{ 0 }; };
 // 스탠스 앵커 상태
 struct PlantState {
     bool planted{ false };
-    glm::vec3 anchorPos{ 0.0f, (float)kFloorY, 0.0f }; // 발바닥 접지점
-    double anchorYaw{ 0.0 }; // (선택) 발 yaw 고정용
+    glm::vec3 anchorPos{ 0.0f, (float)kFloorY, 0.0f };
+    double anchorYaw{ 0.0 };
+    double prevBottomY{ kFloorY };
+
+    // ★ 추가: 팝 방지용 상태
+    int  touchHold{ 0 };       // 접지 후보 연속 프레임 수
+    int  releaseHold{ 0 };     // 해제 후보 연속 프레임 수
+    int  lockAge{ 0 };         // 접지 이후 경과 프레임(풋락 램프-업)
+    bool everPlanted{ false }; // 첫 접지 이후인지(앵커 스무딩 초기화용)
 };
 PlantState gPlantL, gPlantR;
 
@@ -78,6 +126,14 @@ enum class SensorIndex : int {
     RIGHT_LEG, RIGHT_CALF, RIGHT_FOOT,
     COUNT
 };
+
+enum class Foot { NONE, LEFT, RIGHT };
+std::atomic<Foot> gActiveStance{ Foot::NONE };
+glm::vec3 gLastAnchorWorld = glm::vec3(0.0f, (float)kFloorY, 0.0f);
+
+// VTK 좌표계 기준 최소 스텝 길이(노이즈 무시용)
+// (X,Y,Z 모두 VTK 단위. 현재 코드에서 Sensor X/Y는 VTK X/Z로 5배 스케일)
+constexpr double kStepMinWorld = 0.30;    // 필요시 0.2~0.5 사이 튜닝
 
 /* =====================  GLOBAL STATE & SYNCHRO  =========================== */
 std::array<Quaternion, kSensorCount> gLatestQuat{};         // live quats
@@ -152,42 +208,6 @@ static std::string timestampedFilename() {
 }
 
 /* ======================  TCP READER THREAD  ============================== */
-//static void networkThread() {
-//    // ─ WinSock init ─
-//    WSADATA wsa; if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
-//    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-//    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(kPort);
-//    inet_pton(AF_INET, kHost, &addr.sin_addr);
-//    if (bind(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) return;
-//    listen(sock, 1);
-//    SOCKET client = accept(sock, nullptr, nullptr);
-//
-//    const size_t kPktSize = 7 * sizeof(float);             // qw qx qy qz px py pz
-//    const size_t kFrameSize = kPktSize * kSensorCount;        // 196 bytes
-//    char buf[kFrameSize];
-//
-//    while (true) {
-//        // --- receive exactly kFrameSize bytes ---
-//        int recvd = 0;
-//        while (recvd < (int)kFrameSize) {
-//            int n = recv(client, buf + recvd, (int)kFrameSize - recvd, 0);
-//            if (n <= 0) goto cleanup; // disconnected
-//            recvd += n;
-//        }
-//
-//        // --- parse binary floats ---
-//        {
-//            std::lock_guard lk(gMutex);
-//            const float* f = reinterpret_cast<const float*>(buf);
-//            for (int i = 0; i < kSensorCount; ++i, f += 7) {
-//                gLatestQuat[i] = { f[0], f[1], f[2], f[3] };
-//                gLatestPos[i] = { f[4], f[5], f[6] };              // ★★★
-//            }
-//        }
-//    }
-//cleanup:
-//    closesocket(client); closesocket(sock); WSACleanup();
-//}
 static void networkThread() {
     WSADATA wsa; if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { printf("[NET] WSAStartup fail\n"); return; }
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -223,7 +243,7 @@ static void networkThread() {
             recvd += n;
         }
         frameCount++;
-        if ((frameCount % 3000) == 0) printf("[NET] frames: %zu\n", frameCount);
+        if ((frameCount % 10000) == 0) printf("[NET] frames: %zu\n", frameCount);
 
         const float* f = reinterpret_cast<const float*>(buf.data());
         {
@@ -329,15 +349,16 @@ public:
         if (mSensorIdx == static_cast<int>(SensorIndex::PELVIS)) {
             // PELVIS: 절대 위치 + 중심 회전
             glm::vec3 offset;
-            constexpr double kMetersToVtk = 10.0;
+            constexpr double kMetersToVtk = 5.0;
 
             { std::lock_guard lk(gMutex); offset = gPosOffset; }
             auto p = pos + offset;
             // mTransform->Translate(p.x, p.y, p.z);
             // mTransform->Concatenate(Q);
-            mTransform->Translate(p.x, p.z, p.y * kMetersToVtk); //★★★
+            mTransform->Translate(p.x * kMetersToVtk, p.z, p.y * kMetersToVtk); //★★★
             mTransform->Concatenate(Q);
         }
+        
         else {
             // ★★★ 관절들: 연결점에서 회전하도록 수정 ★★★
 
@@ -370,77 +391,290 @@ public:
             gSensorLog.emplace_back(std::move(row));
         }
 
-        // ----- (A) 발 최저점 기록 -----
+
+        // ----- (A) 모든 발 프레임: 자신의 최저 Y(=bottomY)와 월드 XZ 저장 -----
         if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT) ||
-            mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
+            mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT))
+        {
+            // 1) 발 액터의 월드 바운딩 박스 → 최저 Y(=bottomY)
             double b[6];
-            // mActor는 이 콜백이 담당하는 액터(왼발/오른발/기타)임
-            mActor->GetBounds(b);           // b = [xmin, xmax, ymin, ymax, zmin, zmax] (월드 좌표)
-            double bottomY = b[2];          // ymin = 최저점 Y
-            if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT))
+            mActor->GetBounds(b);     // [xmin,xmax, ymin,ymax, zmin,zmax]
+            double bottomY = b[2];
+
+            // 2) 발바닥 "중심" 월드 좌표를 정확히 구함
+            //    로컬에서 발 큐브의 중심은 (0,0,0), 높이 3 → 바닥은 y=-1.5
+            double localBottom[3] = { 0.0, -1.5, 0.0 };
+            double worldBottom[3];
+            mTransform->TransformPoint(localBottom, worldBottom); // 입력/부모 변환 포함
+
+            // 3) 전역 캐시 갱신
+            if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT)) {
                 gLeftFootBottomY.store(bottomY, std::memory_order_relaxed);
-            else
-                gRightFootBottomY.store(bottomY, std::memory_order_relaxed);
-        }
-
-        // ----- (B) 오른발 콜백이 마지막에 불리도록 등록돼 있으므로 여기서 한 번만 보정 -----
-        if (mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
-            double minBottom = std::min(gLeftFootBottomY.load(std::memory_order_relaxed),
-                gRightFootBottomY.load(std::memory_order_relaxed));
-
-            if (minBottom + kClampTol < kFloorY) {
-                double delta = kFloorY - minBottom;   // 바닥까지 올려야 하는 양
-                // 골반 기준 오프셋을 올리면 자식(무릎/발목/발) 전부 같이 올라감
-                std::lock_guard lk(gMutex);
-                gPosOffset.z += static_cast<float>(delta); //★★★ y->z
+                gLeftFootX.store(worldBottom[0], std::memory_order_relaxed);
+                gLeftFootZ.store(worldBottom[2], std::memory_order_relaxed);
             }
-        } // 
-
-        // --- (A) 이 콜백 액터가 발이면, 월드 최저점(ymin)을 기록 ---
-        if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT) ||
-            mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
-            double b[6];
-            mActor->GetBounds(b);         // [xmin, xmax, ymin, ymax, zmin, zmax] in world
-            double bottomY = b[2];        // ymin = 발바닥 최저점
-            if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT))
-                gLeftFootBottomY.store(bottomY, std::memory_order_relaxed);
-            else
+            else {
                 gRightFootBottomY.store(bottomY, std::memory_order_relaxed);
+                gRightFootX.store(worldBottom[0], std::memory_order_relaxed);
+                gRightFootZ.store(worldBottom[2], std::memory_order_relaxed);
+            }
+
+            const double curX = worldBottom[0]; // VTK X
+            const double curZ = worldBottom[2]; // VTK Z
+
+            if (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT)) {
+                if (!gPrevLeftValid.load(std::memory_order_relaxed)) {
+                    gPrevLeftX.store(curX, std::memory_order_relaxed);
+                    gPrevLeftZ.store(curZ, std::memory_order_relaxed);
+                    gPrevLeftValid.store(true, std::memory_order_relaxed);
+                }
+                else {
+                    const double px = gPrevLeftX.load(std::memory_order_relaxed);
+                    const double pz = gPrevLeftZ.load(std::memory_order_relaxed);
+                    const double vx = (curX - px) / kDt;   // VTK/s
+                    const double vz = (curZ - pz) / kDt;
+                    gPrevLeftX.store(curX, std::memory_order_relaxed);
+                    gPrevLeftZ.store(curZ, std::memory_order_relaxed);
+
+                    // 1차 IIR LPF
+                    const double fx = (1.0 - kVelLpfAlpha) * gFiltLeftVX.load(std::memory_order_relaxed)
+                        + kVelLpfAlpha * vx;
+                    const double fz = (1.0 - kVelLpfAlpha) * gFiltLeftVZ.load(std::memory_order_relaxed)
+                        + kVelLpfAlpha * vz;
+                    gFiltLeftVX.store(fx, std::memory_order_relaxed);
+                    gFiltLeftVZ.store(fz, std::memory_order_relaxed);
+                }
+            }
+            else { // RIGHT_FOOT
+                if (!gPrevRightValid.load(std::memory_order_relaxed)) {
+                    gPrevRightX.store(curX, std::memory_order_relaxed);
+                    gPrevRightZ.store(curZ, std::memory_order_relaxed);
+                    gPrevRightValid.store(true, std::memory_order_relaxed);
+                }
+                else {
+                    const double px = gPrevRightX.load(std::memory_order_relaxed);
+                    const double pz = gPrevRightZ.load(std::memory_order_relaxed);
+                    const double vx = (curX - px) / kDt;   // VTK/s
+                    const double vz = (curZ - pz) / kDt;
+                    gPrevRightX.store(curX, std::memory_order_relaxed);
+                    gPrevRightZ.store(curZ, std::memory_order_relaxed);
+
+                    // 1차 IIR LPF
+                    const double fx = (1.0 - kVelLpfAlpha) * gFiltRightVX.load(std::memory_order_relaxed)
+                        + kVelLpfAlpha * vx;
+                    const double fz = (1.0 - kVelLpfAlpha) * gFiltRightVZ.load(std::memory_order_relaxed)
+                        + kVelLpfAlpha * vz;
+                    gFiltRightVX.store(fx, std::memory_order_relaxed);
+                    gFiltRightVZ.store(fz, std::memory_order_relaxed);
+                }
+            }
+
+            // 4) 접지(스탠스) 판정 및 앵커 업데이트
+            PlantState& ps = (mSensorIdx == static_cast<int>(SensorIndex::LEFT_FOOT)) ? gPlantL : gPlantR;
+
+            double vY = bottomY - ps.prevBottomY;      // 프레임당 수직 위치 변화량(속도 근사)
+            ps.prevBottomY = bottomY;
+
+            bool nearFloor = std::abs(bottomY - kFloorY) <= kContactYTol;
+            bool verticalCalm = std::abs(vY) <= kVelTolPerFrame;
+            bool touching = (nearFloor && verticalCalm);
+
+            // ---- 디바운스 카운터 업데이트 ----
+            if (touching) { ps.touchHold++; ps.releaseHold = 0; }
+            else { ps.releaseHold++; ps.touchHold = 0; }
+
+            // ---- 스탠스 진입 ----
+            if (!ps.planted && ps.touchHold >= kTouchHoldFrames) {
+                ps.planted = true;
+                ps.anchorPos = glm::vec3((float)worldBottom[0], (float)kFloorY, (float)worldBottom[2]);
+                ps.lockAge = 0;
+                bool wasEver = ps.everPlanted;
+                ps.everPlanted = true;
+
+                // 새 앵커
+                //glm::vec3 newAnchor((float)worldBottom[0], (float)kFloorY, (float)worldBottom[2]);
+
+
+                // ★ 여기서만: 스텝 오도메트리 누적 + 양발 앵커 co-shift
+                    // --- 스텝 오도메트리 누적 + 앵커 co-shift ---
+                glm::vec3 newAnchor((float)worldBottom[0], (float)kFloorY, (float)worldBottom[2]);
+
+                Foot thisFoot = (mSensorIdx == (int)SensorIndex::LEFT_FOOT) ? Foot::LEFT : Foot::RIGHT;
+                Foot prevFoot = gActiveStance.load(std::memory_order_relaxed);
+
+                if (prevFoot == Foot::NONE) {
+                    gLastAnchorWorld = newAnchor;
+                    gActiveStance.store(thisFoot, std::memory_order_relaxed);
+                }
+                else if (prevFoot != thisFoot) {
+                    glm::vec3 delta = newAnchor - gLastAnchorWorld;            // VTK 평면 Δ(X,Z)
+                    double planar = std::hypot((double)delta.x, (double)delta.z);
+                    if (planar > kStepMinWorld) {
+                        constexpr double kMetersToVtk = 5.0;
+                        std::lock_guard lk(gMutex);
+
+                        // 전역 오프셋 누적
+                        gPosOffset.x += (float)(delta.x / kMetersToVtk); // 좌우(X)
+                        gPosOffset.y += (float)(delta.z / kMetersToVtk); // 앞뒤(Y)  ← 중요!
+
+                        // 앵커들도 같은 Δ만큼 같이 이동(co-shift) → 풋락이 되돌리지 않게
+                        gPlantL.anchorPos.x += delta.x; gPlantL.anchorPos.z += delta.z;
+                        gPlantR.anchorPos.x += delta.x; gPlantR.anchorPos.z += delta.z;
+
+                        
+                    }
+                    gLastAnchorWorld = newAnchor;
+                    gActiveStance.store(thisFoot, std::memory_order_relaxed);
+
+                    printf("[ODOM] dX=%.3f dZ=%.3f | gPos=(%.3f,%.3f,%.3f)\n",
+                        delta.x, delta.z, gPosOffset.x, gPosOffset.y, gPosOffset.z);
+                }
+
+            }
+
+            // ---- 스탠스 유지/해제 ----
+            if (ps.planted) {
+                // 램프-업(풋락 게인 용)
+                if (ps.lockAge < kLockRampFrames) ps.lockAge++;
+
+                // 충분히 떨어진 상태가 일정 프레임 지속되면 해제
+                bool liftedEnough = (bottomY > kFloorY + kLiftYExit);
+                if (liftedEnough && ps.releaseHold >= kReleaseHoldFrames) {
+                    ps.planted = false;
+                    ps.lockAge = 0;
+                }
+            }
+
+            // 스탠스 이탈(점프/스윙 시작): 충분히 바닥에서 떨어지면 해제
+            if (ps.planted && (bottomY > kFloorY + kLiftYExit)) {
+                ps.planted = false;
+            }
         }
 
-        // --- (B) 프레임당 1번: 오른발 콜백에서 전신 오프셋 보정 수행 ---
-        // 등록 순서가 PELVIS → ... → LEFT_FOOT → ... → RIGHT_FOOT 이므로
-        // RIGHT_FOOT가 마지막이라고 가정(현재 main 등록 순서 그대로라면 OK)
+        // ----- (B) 프레임당 1번: RIGHT_FOOT에서만 "센서 Z(수직) 클램프 + 센서 XY 평면 풋락" 수행 -----
         if (mSensorIdx == static_cast<int>(SensorIndex::RIGHT_FOOT)) {
+
+            // 1) 수직(Z_sens=VTK Y) 클램프
             const double leftB = gLeftFootBottomY.load(std::memory_order_relaxed);
             const double rightB = gRightFootBottomY.load(std::memory_order_relaxed);
             const double minBottom = std::min(leftB, rightB);
 
-            // 목표: minBottom == kFloorY (한 발은 반드시 바닥에 닿게)
-            double delta = 0.0;
-            if (minBottom < kFloorY - kClampTol) {
-                // 뚫림: 위로 올림
-                delta = kFloorY - minBottom;  // +값
-            }
-            else if (minBottom > kFloorY + kClampTol) {
-                // 공중부양: 아래로 내림
-                delta = kFloorY - minBottom;  // -값
-            }
+            //double deltaY_vtk = 0.0; // VTK Y == Sensor Z
+            //if (deltaY_vtk != 0.0) {
+            //    // ★ 1프레임 최대 보정 제한
+            //    deltaY_vtk = std::clamp(deltaY_vtk, -kMaxYClampStep, kMaxYClampStep);
 
-            if (std::abs(delta) > 0.0) {
+            //    std::lock_guard lk(gMutex);
+            //    gPosOffset.z += static_cast<float>(deltaY_vtk);
+            //}
+            //if (minBottom < kFloorY - kClampTol) deltaY_vtk = kFloorY - minBottom; // 뚫림 → 위로
+            //else if (minBottom > kFloorY + kClampTol) deltaY_vtk = kFloorY - minBottom; // 부양 → 아래로
+
+            //if (deltaY_vtk != 0.0) {
+            //    std::lock_guard lk(gMutex);
+            //    // 주의: VTK Y는 gPosOffset.z에 매핑됨 (pelvis Translate에서 확인)
+            //    gPosOffset.z += static_cast<float>(deltaY_vtk);
+            //}
+            double deltaY_vtk = 0.0;
+            if (minBottom < kFloorY - kClampTol)      deltaY_vtk = kFloorY - minBottom;
+            else if (minBottom > kFloorY + kClampTol) deltaY_vtk = kFloorY - minBottom;
+
+            deltaY_vtk = std::clamp(deltaY_vtk, -kMaxYClampStep, kMaxYClampStep);
+            if (deltaY_vtk != 0.0) {
                 std::lock_guard lk(gMutex);
-                // 전신(골반 상위) 오프셋에 반영 → 다음 프레임부터 즉시 적용
-                gPosOffset.z += static_cast<float>(delta);
+                gPosOffset.z += static_cast<float>(deltaY_vtk); // VTK Y ↔ gPosOffset.z
+            }
 
-                // (선택) 프레임당 이동량 제한으로 급격한 튐 방지
-                // const double kMaxStep = 5.0; // 필요시 사용
-                // gPosOffset.y += static_cast<float>(std::clamp(delta, -kMaxStep, kMaxStep));
+            // 2) 평면 풋락: 센서 XY 고정  (센서 XY == VTK XZ)
+            const bool L = gPlantL.planted;
+            const bool R = gPlantR.planted;
+
+
+
+            if (L || R) {
+                // 평균 slip 속도( VTK/s )
+                double vX = 0.0, vZ = 0.0; int cnt = 0;
+                if (L) {
+                    vX += gFiltLeftVX.load(std::memory_order_relaxed);
+                    vZ += gFiltLeftVZ.load(std::memory_order_relaxed); ++cnt;
+                }
+                if (R) {
+                    vX += gFiltRightVX.load(std::memory_order_relaxed);
+                    vZ += gFiltRightVZ.load(std::memory_order_relaxed); ++cnt;
+                }
+                if (cnt > 0) { vX /= cnt; vZ /= cnt; }
+
+                // v=0 유도: Δoffset( VTK/frame ) = -gain * v * dt
+                double stepX_vtk = std::clamp(-kVelCancelGain * vX * kDt,
+                    -kMaxVelCancelStep, kMaxVelCancelStep);
+                double stepZ_vtk = std::clamp(-kVelCancelGain * vZ * kDt,
+                    -kMaxVelCancelStep, kMaxVelCancelStep);
+
+                if (std::abs(stepX_vtk) > 0.0 || std::abs(stepZ_vtk) > 0.0) {
+                    constexpr double kMetersToVtk = 5.0; // 파일 내 기존 스케일 상수와 동일
+                    std::lock_guard lk(gMutex);
+                    // VTK X ← gPosOffset.x,    VTK Z ← gPosOffset.y  (PELVIS Translate 참고)
+                    gPosOffset.x += static_cast<float>(stepX_vtk / kMetersToVtk);
+                    gPosOffset.y += static_cast<float>(stepZ_vtk / kMetersToVtk);
+                }
+            }
+
+
+
+            if (L || R) {
+
+
+                // 현재 발바닥 위치 (VTK XZ ← Sensor XY)
+                const double curLX_vtkX = gLeftFootX.load(std::memory_order_relaxed);
+                const double curLY_sens = gLeftFootZ.load(std::memory_order_relaxed);   // VTK Z == Sensor Y
+
+                const double curRX_vtkX = gRightFootX.load(std::memory_order_relaxed);
+                const double curRY_sens = gRightFootZ.load(std::memory_order_relaxed);  // VTK Z == Sensor Y
+
+                // 앵커 (VTK XZ ← Sensor XY)
+                const double tgtLX_vtkX = gPlantL.anchorPos.x;
+                const double tgtLY_sens = gPlantL.anchorPos.z;  // 저장 시 z필드는 VTK Z(=Sensor Y)
+
+                const double tgtRX_vtkX = gPlantR.anchorPos.x;
+                const double tgtRY_sens = gPlantR.anchorPos.z;
+
+                // 에러(양발 접지면 평균)
+                double eX_sens = 0.0, eY_sens = 0.0;
+                int cnt = 0;
+                if (L) { eX_sens += (tgtLX_vtkX - curLX_vtkX); eY_sens += (tgtLY_sens - curLY_sens); ++cnt; }
+                if (R) { eX_sens += (tgtRX_vtkX - curRX_vtkX); eY_sens += (tgtRY_sens - curRY_sens); ++cnt; }
+                if (cnt > 0) { eX_sens /= cnt; eY_sens /= cnt; }
+
+                // 데드존
+                if (std::abs(eX_sens) < kDeadXY) eX_sens = 0.0;
+                if (std::abs(eY_sens) < kDeadXY) eY_sens = 0.0;
+
+                if (eX_sens != 0.0 || eY_sens != 0.0) {
+                    // ★ 동적 게인: 접지 경과 프레임(lockAge)로 램프-업(0~1)
+                    double rampL = (L ? std::min(1.0, gPlantL.lockAge / (double)kLockRampFrames) : 0.0);
+                    double rampR = (R ? std::min(1.0, gPlantR.lockAge / (double)kLockRampFrames) : 0.0);
+                    double ramp = 0.0; int cntGain = 0;
+                    if (L) { ramp += rampL; ++cntGain; }
+                    if (R) { ramp += rampR; ++cntGain; }
+                    if (cntGain > 0) ramp /= cntGain;
+
+                    // 기본 게인에 램프 반영
+                    double dynGain = kLockGain * ramp;
+
+                    // 게인 + 스텝 제한
+                    double stepX = std::clamp(eX_sens * dynGain, -kMaxStepXY, kMaxStepXY); // Sensor X → VTK X
+                    double stepY = std::clamp(eY_sens * dynGain, -kMaxStepXY, kMaxStepXY); // Sensor Y → VTK Z
+
+                    constexpr double kMetersToVtk = 5.0;
+                    std::lock_guard lk(gMutex);
+                    gPosOffset.x += static_cast<float>(stepX / kMetersToVtk);
+                    gPosOffset.y += static_cast<float>(stepY / kMetersToVtk);
+                }
             }
         }
 
 
         if (mSensorIdx == 0) mRenWin->Render();
-
 
     }
 
@@ -513,7 +747,7 @@ int main() {
     renderer->SetBackground(colors->GetColor3d("White").GetData());
 
     auto renderWin = vtkSmartPointer<vtkRenderWindow>::New();
-    renderWin->SetWindowName("ROBOT 7ea Sensors (C++) - Fixed Rotation Axis");
+    renderWin->SetWindowName("VTK Motion Capture");
     renderWin->SetSize(700, 900);
     renderWin->AddRenderer(renderer);
 
@@ -521,8 +755,6 @@ int main() {
     iren->SetRenderWindow(renderWin);
 
     /* --- floor grid setup --- */
-
-
     auto plane = vtkSmartPointer<vtkPlaneSource>::New();
     //int floorY = -49;
     plane->SetOrigin(-1000, kFloorY, -1000);
