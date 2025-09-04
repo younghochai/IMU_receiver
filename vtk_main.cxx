@@ -51,8 +51,8 @@ std::atomic<double> gRightFootBottomY{ kFloorY };
 std::atomic<double> gLeftFootMidX{ 0 }, gLeftFootMidZ{ 0 };
 std::atomic<double> gRightFootMidX{ 0 }, gRightFootMidZ{ 0 };
 
-constexpr double kContactYTol = 0.8;   // 바닥과의 Y 거리 허용치
-constexpr double kLiftYExit = 1.5;   // 접지 해제(리프트) 문턱
+constexpr double kContactYTol = 0.3;   // 바닥과의 Y 거리 허용치
+constexpr double kLiftYExit = 2.5;   // 접지 해제(리프트) 문턱
 constexpr double kVelTolPerFrame = 0.06;  // 프레임당 수직 이동 허용치(10ms 타이머 기준)
 constexpr double kDeadXY = 0.30;  // XY 데드존(사소한 미끄러짐 무시)
 constexpr double kLockGain = 0.60;  // 보정 게인(0~1)
@@ -80,13 +80,13 @@ std::atomic<double> gLeftFootX{ 0.0 }, gLeftFootZ{ 0.0 };
 std::atomic<double> gRightFootX{ 0.0 }, gRightFootZ{ 0.0 };
 
 // 발바닥 월드 XZ 이전값(속도 추정용)
-std::atomic<double> gPrevLeftX{0.0},  gPrevLeftZ{0.0};
-std::atomic<double> gPrevRightX{0.0}, gPrevRightZ{0.0};
-std::atomic_bool    gPrevLeftValid{false}, gPrevRightValid{false};
+std::atomic<double> gPrevLeftX{ 0.0 }, gPrevLeftZ{ 0.0 };
+std::atomic<double> gPrevRightX{ 0.0 }, gPrevRightZ{ 0.0 };
+std::atomic_bool    gPrevLeftValid{ false }, gPrevRightValid{ false };
 
 // 저역통과된 평면 속도( VTK 단위: X,Z / 초 )
-std::atomic<double> gFiltLeftVX{0.0},  gFiltLeftVZ{0.0};
-std::atomic<double> gFiltRightVX{0.0}, gFiltRightVZ{0.0};
+std::atomic<double> gFiltLeftVX{ 0.0 }, gFiltLeftVZ{ 0.0 };
+std::atomic<double> gFiltRightVX{ 0.0 }, gFiltRightVZ{ 0.0 };
 
 
 namespace fs = std::filesystem;
@@ -133,7 +133,7 @@ glm::vec3 gLastAnchorWorld = glm::vec3(0.0f, (float)kFloorY, 0.0f);
 
 // VTK 좌표계 기준 최소 스텝 길이(노이즈 무시용)
 // (X,Y,Z 모두 VTK 단위. 현재 코드에서 Sensor X/Y는 VTK X/Z로 5배 스케일)
-constexpr double kStepMinWorld = 0.30;    // 필요시 0.2~0.5 사이 튜닝
+constexpr double kStepMinWorld = 0.40;    // 필요시 0.2~0.5 사이 튜닝
 
 /* =====================  GLOBAL STATE & SYNCHRO  =========================== */
 std::array<Quaternion, kSensorCount> gLatestQuat{};         // live quats
@@ -144,6 +144,14 @@ std::array<std::array<double, 16>, kSensorCount> gBaseTransforms; // B matrices
 std::mutex               gMutex;
 std::atomic_bool         gSaving{ false };
 std::vector<std::vector<double>> gSensorLog;  // ts + 7×7 floats
+// 기록 시작 상대초 기준
+inline std::atomic<double> gT0Sec{ -1.0 };
+
+// 단조 증가 시각을 초(double)로 반환
+inline double SteadySeconds() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
 
 glm::vec3 gPosOffset = glm::vec3(0.0f);
 
@@ -168,6 +176,55 @@ static inline std::array<double, 16> quatToMatrix(const Quaternion& q) {
         0,0,0,1
     };
 }
+
+//==================================================== wx wy wz
+// --- 헬퍼(파일 상단 어딘가 1회만) ---
+struct Quat { double w, x, y, z; };
+inline Quat qConj(const Quat& q) { return { q.w, -q.x, -q.y, -q.z }; }
+inline Quat qMul(const Quat& a, const Quat& b) {
+    return {
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+    };
+}
+inline double qDot(const Quat& a, const Quat& b) { return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z; }
+inline Quat qNorm(Quat q) {
+    double n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (n <= 0) return { 1,0,0,0 };
+    return { q.w / n, q.x / n, q.y / n, q.z / n };
+}
+// qPrev→qCurr의 ω(rad/s, body)
+inline void quatToOmega(const Quat& qPrevIn, Quat qCurrIn, double dt, double out[3]) {
+    Quat qPrev = qNorm(qPrevIn);
+    Quat qCurr = qNorm(qCurrIn);
+    // hemisphere fix
+    if (qDot(qPrev, qCurr) < 0.0) { qCurr.w = -qCurr.w; qCurr.x = -qCurr.x; qCurr.y = -qCurr.y; qCurr.z = -qCurr.z; }
+    // Δq
+    Quat dq = qNorm(qMul(qConj(qPrev), qCurr));
+    double w = std::clamp(dq.w, -1.0, 1.0);
+    double s = std::sqrt(std::max(0.0, 1.0 - w * w)); // = sin(theta/2)
+    if (dt <= 0.0 || !std::isfinite(dt)) { out[0] = out[1] = out[2] = 0.0; return; }
+    if (s < 1e-6) { // 소각 근사: Δq ≈ [1, 0.5*ω*dt]
+        out[0] = 2.0 * dq.x / dt;
+        out[1] = 2.0 * dq.y / dt;
+        out[2] = 2.0 * dq.z / dt;
+        return;
+    }
+    double theta = 2.0 * std::atan2(s, w);
+    double invs = 1.0 / s;
+    out[0] = (theta / dt) * dq.x * invs;
+    out[1] = (theta / dt) * dq.y * invs;
+    out[2] = (theta / dt) * dq.z * invs;
+}
+inline bool quatAlmostEqual(const Quat& a, const Quat& b, double eps = 1e-8) {
+    // 거리 ≈ 1 - |dot| 사용(회전 동일성 측정)
+    return (1.0 - std::abs(qDot(qNorm(a), qNorm(b)))) < eps;
+}
+
+
+
 
 /* ======================  VTK SOURCE FACTORIES  =========================== */
 static vtkSmartPointer<vtkCubeSource> makeCube(double x, double y, double z) {
@@ -267,25 +324,112 @@ public:
     void Execute(vtkObject* caller, unsigned long, void*) override {
         auto iren = static_cast<vtkRenderWindowInteractor*>(caller);
         std::string key = iren->GetKeySym();
-        if (key == "r") { gSaving = true; gSensorLog.clear(); printf("[LOG] recording...\n"); }
+        if (key == "r") {
+            gSaving = true;
+            gSensorLog.clear();
+
+            gT0Sec.store(SteadySeconds(), std::memory_order_relaxed);  // 기준시각 = 지금
+            printf("[LOG] recording...\n");
+        }
+        //else if (key == "s") {
+        //    gSaving = false; printf("[LOG] stop & save\n");
+        //    std::ofstream csv(timestampedFilename());
+        //    // header
+        //    csv << "timestamp";
+        //    for (int i = 1; i <= kSensorCount; ++i) {
+        //        csv << ",sensor" << i << "_w, sensor" << i << "_x, sensor" << i << "_y, sensor" << i << "_z";
+        //        csv << ", sensor" << i << "_px, sensor" << i << "_py, sensor" << i << "_pz";           // ★★★
+        //    }
+        //    csv << "\n";
+        //    // rows
+        //    for (auto& row : gSensorLog) {
+        //        for (size_t i = 0; i < row.size(); ++i) csv << (i ? "," : "") << row[i];
+        //        csv << "\n";
+        //    }
+        //    printf("[LOG] CSV saved (%zu rows)\n", gSensorLog.size());
+        //}
+        //else if (key == "s") {
+        //    gSaving = false; printf("[LOG] stop & save\n");
+        //    std::ofstream csv(timestampedFilename());
+        //    csv << std::fixed << std::setprecision(9);  // ← 중요: 타임스탬프/수치 정밀도
+        //    // header
+        //    csv << "timestamp";
+        //    for (int i = 1; i <= kSensorCount; ++i) {
+        //        csv << ",sensor" << i << "_w, sensor" << i << "_x, sensor" << i << "_y, sensor" << i << "_z";
+        //        csv << ", sensor" << i << "_px, sensor" << i << "_py, sensor" << i << "_pz";
+        //    }
+        //    csv << "\n";
+        //    // rows
+        //    for (auto& row : gSensorLog) {
+        //        for (size_t i = 0; i < row.size(); ++i) csv << (i ? "," : "") << row[i];
+        //        csv << "\n";
+        //    }
+        //    printf("[LOG] CSV saved (%zu rows)\n", gSensorLog.size());
+        //}
+        // --- 's' 분기 전체 교체 ---
         else if (key == "s") {
             gSaving = false; printf("[LOG] stop & save\n");
+            if (gSensorLog.empty()) { printf("[LOG] no data\n"); return; }
+
             std::ofstream csv(timestampedFilename());
-            // header
+            csv << std::fixed << std::setprecision(9);
+
+            // 헤더: timestamp + 센서별 wx,wy,wz + px,py,pz
             csv << "timestamp";
             for (int i = 1; i <= kSensorCount; ++i) {
-                csv << ",sensor" << i << "_w, sensor" << i << "_x, sensor" << i << "_y, sensor" << i << "_z";
-                csv << ", sensor" << i << "_px, sensor" << i << "_py, sensor" << i << "_pz";           // ★★★
+                csv << ",sensor" << i << "_wx, sensor" << i << "_wy, sensor" << i << "_wz";
+                csv << ", sensor" << i << "_px, sensor" << i << "_py, sensor" << i << "_pz";
             }
             csv << "\n";
-            // rows
-            for (auto& row : gSensorLog) {
-                for (size_t i = 0; i < row.size(); ++i) csv << (i ? "," : "") << row[i];
+
+            const size_t R = gSensorLog.size();
+
+            // 센서별 “마지막으로 바뀐 행 idx”와 “직전 ω” 유지
+            std::vector<size_t> lastChange(R, 0); // 임시, 센서별 따로 가야 하므로 아래서 재할당
+            std::vector<size_t> lastIdx(kSensorCount, 0);
+            std::vector<std::array<double, 3>> lastOmega(kSensorCount, { 0.0,0.0,0.0 });
+
+            // 초기 기준 쿼터니언(행 0)
+            for (int si = 0; si < kSensorCount; ++si) lastIdx[si] = 0;
+
+            for (size_t r = 0; r < R; ++r) {
+                const auto& row = gSensorLog[r];
+                csv << row[0]; // timestamp (상대초)
+
+                for (int si = 0; si < kSensorCount; ++si) {
+                    int off = 1 + si * 7; // [w,x,y,z, px,py,pz]
+                    // 현재 쿼터니언
+                    Quat qc{ row[off + 0], row[off + 1], row[off + 2], row[off + 3] };
+
+                    // 마지막으로 “값이 바뀌었던” 행
+                    size_t rPrev = lastIdx[si];
+                    const auto& prev = gSensorLog[rPrev];
+                    Quat qp{ prev[off + 0], prev[off + 1], prev[off + 2], prev[off + 3] };
+
+                    double omega[3] = { lastOmega[si][0], lastOmega[si][1], lastOmega[si][2] };
+
+                    // 쿼터니언이 충분히 달라졌으면(센서 갱신 발생) 새 ω 계산
+                    if (!quatAlmostEqual(qp, qc, 1e-8)) {
+                        double dt = row[0] - gSensorLog[rPrev][0]; // “바뀐 시점”부터 누적 Δt
+                        quatToOmega(qp, qc, dt, omega);
+                        lastOmega[si] = { omega[0], omega[1], omega[2] };
+                        lastIdx[si] = r; // 이번 행을 “마지막 변경 행”으로 갱신
+                    }
+                    // else: 값 안 바뀜 → ω는 직전 값(ZOH) 유지
+
+                    // 기록: ω + pos
+                    csv << "," << omega[0] << "," << omega[1] << "," << omega[2];
+                    csv << "," << row[off + 4] << "," << row[off + 5] << "," << row[off + 6];
+                }
                 csv << "\n";
             }
             printf("[LOG] CSV saved (%zu rows)\n", gSensorLog.size());
         }
-        else if (key == "c") { std::lock_guard lk(gMutex); gCalibrationOffset = gLatestQuat; printf("[LOG] calibrated\n"); }
+
+
+        else if (key == "c") {
+            std::lock_guard lk(gMutex); gCalibrationOffset = gLatestQuat; printf("[LOG] calibrated\n");
+        }
         else if (key == "o") {
             std::lock_guard lk(gMutex);
             const auto& p0 = gLatestPos[(int)SensorIndex::PELVIS];
@@ -358,7 +502,7 @@ public:
             mTransform->Translate(p.x * kMetersToVtk, p.z, p.y * kMetersToVtk); //★★★
             mTransform->Concatenate(Q);
         }
-        
+
         else {
             // ★★★ 관절들: 연결점에서 회전하도록 수정 ★★★
 
@@ -375,11 +519,34 @@ public:
         }
 
         // 로깅 (센서 0에서만 한 번)
-        if (mSensorIdx == 0 && gSaving.load()) {
-            double ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        //if (mSensorIdx == 0 && gSaving.load()) {
+        //    double nowSec = std::chrono::duration<double>(
+        //        std::chrono::system_clock::now().time_since_epoch()).count();
+        //    double t0 = gT0Sec.load(std::memory_order_relaxed);
+        //    double ts = (t0 > 0.0) ? (nowSec - t0) : nowSec;  // 상대초(기본 0.000부터)
+        //    std::vector<double> row;
+        //    row.reserve(1 + 7 * kSensorCount);
+        //    row.push_back(ts);
+
+        //    std::lock_guard lk(gMutex);
+        //    for (int i = 0; i < kSensorCount; ++i) {
+        //        const auto& q = gLatestQuat[i];
+        //        const auto& p = gLatestPos[i];
+        //        row.push_back(q.w); row.push_back(q.x); row.push_back(q.y); row.push_back(q.z);
+        //        row.push_back(p.x); row.push_back(p.y); row.push_back(p.z);
+        //    }
+        //    gSensorLog.emplace_back(std::move(row));
+        //}
+        if (mSensorIdx == 0 && gSaving) {
+            // 상대시간(ts) = now - t0 (0부터 시작)
+            double t0 = gT0Sec.load(std::memory_order_relaxed);
+            if (!(t0 > 0.0)) { gT0Sec.store(SteadySeconds(), std::memory_order_relaxed); t0 = gT0Sec.load(); }
+            double ts = SteadySeconds() - t0;
+            if (!std::isfinite(ts) || ts < 0.0) ts = 0.0;
+
             std::vector<double> row;
             row.reserve(1 + 7 * kSensorCount);
-            row.push_back(ts);
+            row.push_back(ts);  // ← 첫 컬럼을 상대 timestamp로
 
             std::lock_guard lk(gMutex);
             for (int i = 0; i < kSensorCount; ++i) {
@@ -403,7 +570,7 @@ public:
 
             // 2) 발바닥 "중심" 월드 좌표를 정확히 구함
             //    로컬에서 발 큐브의 중심은 (0,0,0), 높이 3 → 바닥은 y=-1.5
-            double localBottom[3] = { 0.0, -1.5, 0.0 };
+            double localBottom[3] = { 0.0, -1.5, -2.0 };
             double worldBottom[3];
             mTransform->TransformPoint(localBottom, worldBottom); // 입력/부모 변환 포함
 
@@ -521,7 +688,7 @@ public:
                         gPlantL.anchorPos.x += delta.x; gPlantL.anchorPos.z += delta.z;
                         gPlantR.anchorPos.x += delta.x; gPlantR.anchorPos.z += delta.z;
 
-                        
+
                     }
                     gLastAnchorWorld = newAnchor;
                     gActiveStance.store(thisFoot, std::memory_order_relaxed);
@@ -591,39 +758,97 @@ public:
 
 
 
+            //if (L || R) {
+            //    // 평균 slip 속도( VTK/s )
+            //    double vX = 0.0, vZ = 0.0; int cnt = 0;
+            //    if (L) {
+            //        vX += gFiltLeftVX.load(std::memory_order_relaxed);
+            //        vZ += gFiltLeftVZ.load(std::memory_order_relaxed); ++cnt;
+            //    }
+            //    if (R) {
+            //        vX += gFiltRightVX.load(std::memory_order_relaxed);
+            //        vZ += gFiltRightVZ.load(std::memory_order_relaxed); ++cnt;
+            //    }
+            //    if (cnt > 0) { vX /= cnt; vZ /= cnt; }
+
+            //    // v=0 유도: Δoffset( VTK/frame ) = -gain * v * dt
+            //    double stepX_vtk = std::clamp(-kVelCancelGain * vX * kDt,
+            //        -kMaxVelCancelStep, kMaxVelCancelStep);
+            //    double stepZ_vtk = std::clamp(-kVelCancelGain * vZ * kDt,
+            //        -kMaxVelCancelStep, kMaxVelCancelStep);
+
+            //    if (std::abs(stepX_vtk) > 0.0 || std::abs(stepZ_vtk) > 0.0) {
+            //        constexpr double kMetersToVtk = 5.0; // 파일 내 기존 스케일 상수와 동일
+            //        std::lock_guard lk(gMutex);
+            //        // VTK X ← gPosOffset.x,    VTK Z ← gPosOffset.y  (PELVIS Translate 참고)
+            //        gPosOffset.x += static_cast<float>(stepX_vtk / kMetersToVtk);
+            //        gPosOffset.y += static_cast<float>(stepZ_vtk / kMetersToVtk);
+            //    }
+            //}
             if (L || R) {
-                // 평균 slip 속도( VTK/s )
-                double vX = 0.0, vZ = 0.0; int cnt = 0;
-                if (L) {
-                    vX += gFiltLeftVX.load(std::memory_order_relaxed);
-                    vZ += gFiltLeftVZ.load(std::memory_order_relaxed); ++cnt;
-                }
-                if (R) {
-                    vX += gFiltRightVX.load(std::memory_order_relaxed);
-                    vZ += gFiltRightVZ.load(std::memory_order_relaxed); ++cnt;
-                }
-                if (cnt > 0) { vX /= cnt; vZ /= cnt; }
+                // 활성 스탠스 1발만 대상으로 v=0(속도-락) 보정
+                double vX = 0.0, vZ = 0.0;
+                bool   have = false;
 
-                // v=0 유도: Δoffset( VTK/frame ) = -gain * v * dt
-                double stepX_vtk = std::clamp(-kVelCancelGain * vX * kDt,
-                    -kMaxVelCancelStep, kMaxVelCancelStep);
-                double stepZ_vtk = std::clamp(-kVelCancelGain * vZ * kDt,
-                    -kMaxVelCancelStep, kMaxVelCancelStep);
+                Foot active = gActiveStance.load(std::memory_order_relaxed);
 
-                if (std::abs(stepX_vtk) > 0.0 || std::abs(stepZ_vtk) > 0.0) {
-                    constexpr double kMetersToVtk = 5.0; // 파일 내 기존 스케일 상수와 동일
-                    std::lock_guard lk(gMutex);
-                    // VTK X ← gPosOffset.x,    VTK Z ← gPosOffset.y  (PELVIS Translate 참고)
-                    gPosOffset.x += static_cast<float>(stepX_vtk / kMetersToVtk);
-                    gPosOffset.y += static_cast<float>(stepZ_vtk / kMetersToVtk);
+                // 1) 활성 스탠스가 유효하면 그 발을 우선 사용
+                if (active == Foot::LEFT && L) {
+                    vX = gFiltLeftVX.load(std::memory_order_relaxed);
+                    vZ = gFiltLeftVZ.load(std::memory_order_relaxed);
+                    have = true;
+                }
+                else if (active == Foot::RIGHT && R) {
+                    vX = gFiltRightVX.load(std::memory_order_relaxed);
+                    vZ = gFiltRightVZ.load(std::memory_order_relaxed);
+                    have = true;
+                }
+                else {
+                    // 2) 활성 스탠스가 없거나 비유효하면 폴백
+                    if (L && !R) {
+                        vX = gFiltLeftVX.load(std::memory_order_relaxed);
+                        vZ = gFiltLeftVZ.load(std::memory_order_relaxed);
+                        have = true;
+                    }
+                    else if (R && !L) {
+                        vX = gFiltRightVX.load(std::memory_order_relaxed);
+                        vZ = gFiltRightVZ.load(std::memory_order_relaxed);
+                        have = true;
+                    }
+                    else if (L && R) {
+                        // 둘 다 접지면 더 낮은(bottomY) 발을 선택
+                        double lB = gLeftFootBottomY.load(std::memory_order_relaxed);
+                        double rB = gRightFootBottomY.load(std::memory_order_relaxed);
+                        if (lB <= rB) {
+                            vX = gFiltLeftVX.load(std::memory_order_relaxed);
+                            vZ = gFiltLeftVZ.load(std::memory_order_relaxed);
+                        }
+                        else {
+                            vX = gFiltRightVX.load(std::memory_order_relaxed);
+                            vZ = gFiltRightVZ.load(std::memory_order_relaxed);
+                        }
+                        have = true;
+                    }
+                }
+
+                if (have) {
+                    // v=0 유도: Δoffset(VTK/frame) = -gain * v * dt (VTK X←offset.x, VTK Z←offset.y)
+                    double stepX_vtk = std::clamp(-kVelCancelGain * vX * kDt, -kMaxVelCancelStep, kMaxVelCancelStep);
+                    double stepZ_vtk = std::clamp(-kVelCancelGain * vZ * kDt, -kMaxVelCancelStep, kMaxVelCancelStep);
+
+                    if (std::abs(stepX_vtk) > 0.0 || std::abs(stepZ_vtk) > 0.0) {
+                        constexpr double kMetersToVtk = 5.0; // 기존 스케일과 동일
+                        std::lock_guard lk(gMutex);
+                        gPosOffset.x += static_cast<float>(stepX_vtk / kMetersToVtk); // VTK X
+                        gPosOffset.y += static_cast<float>(stepZ_vtk / kMetersToVtk); // VTK Z
+                    }
                 }
             }
 
 
 
+
             if (L || R) {
-
-
                 // 현재 발바닥 위치 (VTK XZ ← Sensor XY)
                 const double curLX_vtkX = gLeftFootX.load(std::memory_order_relaxed);
                 const double curLY_sens = gLeftFootZ.load(std::memory_order_relaxed);   // VTK Z == Sensor Y
@@ -792,7 +1017,7 @@ int main() {
     tex->InterpolateOff();  // 픽셀 또렷하게
     tex->RepeatOn();        // UV 반복 허용
 
-    
+
 
     auto floorMapper = vtkSmartPointer<vtkPolyDataMapper>::New();
     floorMapper->SetInputConnection(plane->GetOutputPort());
