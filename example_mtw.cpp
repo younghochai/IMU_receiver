@@ -5,9 +5,6 @@
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
-#include <xsensdeviceapi.h>
-#include "conio.h"
-
 #include <string>
 #include <stdexcept>
 #include <iostream>
@@ -20,10 +17,12 @@
 #include <cassert>
 #include <vector>
 #include <array>
+#include <chrono>
 
+#include <xsensdeviceapi.h>
+#include "conio.h"
 #include "xsmutex.h"
 #include <xstypes/xstime.h>
-
 #include <glm/glm.hpp>
 
 
@@ -526,13 +525,11 @@ int main(int argc, char* argv[])
 		std::cout << "\nMain loop. Press any key to quit\n" << std::endl;
 		std::cout << "Waiting for data available..." << std::endl;
 
+		// ───── (1) 준비부 ───────────
 		std::vector<XsQuaternion> quaternionData(mtwCallbacks.size()); // Room to store quaternion data for each MTW
 		std::vector<XsVector> accelerationData(mtwCallbacks.size());
-		//unsigned int printCounter = 0;
-		static unsigned long frame = 0;
-		constexpr unsigned PRINT_EVERY = 1800; // 
-
-		// ───── (1) 준비부 ─────────────────────────────────────────────────────
+		unsigned int printCounter = 0;
+		
 		const double dtFixed = 1.0 / newUpdateRate;            // 75 Hz = 0.0133 s ★★★
 		const glm::vec3 g(0.0f, 0.0f, 9.81f);                  // 중력벡터 (world) ★★★
 
@@ -549,68 +546,70 @@ int main(int argc, char* argv[])
 			// 1) 최신 패킷 수집
 			for (size_t i = 0; i < mtwCallbacks.size(); ++i) {
 				if (!mtwCallbacks[i]->dataAvailable()) continue;
-
 				newData = true;
 				const XsDataPacket* packet = mtwCallbacks[i]->getLatestPacket();
+
 				quaternionData[i] = packet->orientationQuaternion();
-				//accelerationData[i] = packet->calibratedAcceleration();
 				accelerationData[i] = packet->freeAcceleration();
+
 				mtwCallbacks[i]->clearPackets();
-				//std::cout << "asd" << std::endl;
 			}
 
 			if (newData) {
-					size_t i = POS_SENSOR;
-					XsVector accW_xs = quatRotate(quaternionData[i], accelerationData[i]);
-					glm::vec3 accW(accW_xs[0], accW_xs[1], accW_xs[2]);
+				// POS_SENSOR 인덱스의 센서에 대해서만 위치 계산
+				if (POS_SENSOR < accelerationData.size()) {
+					// XsVector를 glm::vec3로 올바르게 변환
+					glm::vec3 accW(
+						static_cast<float>(accelerationData[POS_SENSOR][0]),
+						static_cast<float>(accelerationData[POS_SENSOR][1]),
+						static_cast<float>(accelerationData[POS_SENSOR][2])
+					);
 
-					//glm::vec3 accLin = accW - g;
-					glm::vec3 accLin = accW;
-					vel[i] += accLin * static_cast<float>(dtFixed);
+					// ZUPT (Zero Velocity Update)
+					if (glm::length(accW) < 0.2f) {
+						vel[POS_SENSOR] = glm::vec3(0.0f);
+					}
+					else {
+						// 가속도 적분으로 속도 업데이트
+						vel[POS_SENSOR] += accW * static_cast<float>(dtFixed);
+					}
 
-					// ZUPT
-					if (glm::length(accLin) < 0.3f)
-						vel[i] = glm::vec3(0.0f);
-
-					pos[i] += vel[i] * static_cast<float>(dtFixed);
+					// 속도 적분으로 위치 업데이트
+					pos[POS_SENSOR] += vel[POS_SENSOR] * static_cast<float>(dtFixed);
 				}
 
-				// 나머지 센서는 위치 0으로(또는 이전 값 유지하고 싶으면 이 블록 삭제)
-				for (size_t i = 0; i < mtwCallbacks.size(); ++i) {
-					if (i == POS_SENSOR) continue;
-					pos[i] = glm::vec3(0.0f);
+				// 나머지 센서들의 위치는 0으로 설정
+				for (size_t i = 0; i < pos.size(); ++i) {
+					if (i != POS_SENSOR) {
+						pos[i] = glm::vec3(0.0f);
+					}
 				}
-				if ((frame % PRINT_EVERY) == 0) {
-					for (size_t i = 0; i < quaternionData.size(); ++i)
-						debugPrintPose(i, quaternionData[i], pos[i]);
-				}
-				frame++;
+
 				// 5) 송신 (논블로킹, 버퍼 꽉 차면 프레임 드롭하고 계속)
 				sendPoseData(sock, quaternionData, pos);
-				//std::cout << "send !" << std::endl;
 			}
-			
-
-
-			// ───── 루프 종료 후 정리(여기서만 종료) ─────────────────────────────
-			std::cout << "Stopping measurement..." << std::endl;
-
-			std::cout << "Setting config mode..." << std::endl;
-			if (!wirelessMasterDevice->gotoConfig()) {
-				std::ostringstream error;
-				error << "Failed to goto config mode: " << *wirelessMasterDevice;
-				throw std::runtime_error(error.str());
-			}
-
-			std::cout << "Disabling radio... " << std::endl;
-			if (!wirelessMasterDevice->disableRadio()) {
-				std::ostringstream error;
-				error << "Failed to disable radio: " << *wirelessMasterDevice;
-				throw std::runtime_error(error.str());
-			}
-			closesocket(sock);
-			WSACleanup();
 		}
+			
+		// ───── 루프 종료 후 정리(여기서만 종료) ─────────────────────────────
+		std::cout << "Stopping measurement..." << std::endl;
+
+		std::cout << "Setting config mode..." << std::endl;
+		if (!wirelessMasterDevice->gotoConfig()) {
+			std::ostringstream error;
+			error << "Failed to goto config mode: " << *wirelessMasterDevice;
+			throw std::runtime_error(error.str());
+		}
+
+		std::cout << "Disabling radio... " << std::endl;
+		if (!wirelessMasterDevice->disableRadio()) {
+			std::ostringstream error;
+			error << "Failed to disable radio: " << *wirelessMasterDevice;
+			throw std::runtime_error(error.str());
+		}
+		closesocket(sock);
+		WSACleanup();
+		}
+
 	catch (std::exception const& ex)
 		{
 			std::cout << ex.what() << std::endl;
