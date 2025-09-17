@@ -5,9 +5,6 @@
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
-#include <xsensdeviceapi.h>
-#include "conio.h"
-
 #include <string>
 #include <stdexcept>
 #include <iostream>
@@ -22,14 +19,11 @@
 #include <array>
 #include <chrono>
 
+#include <xsensdeviceapi.h>
+#include "conio.h"
 #include "xsmutex.h"
 #include <xstypes/xstime.h>
-
 #include <glm/glm.hpp>
-
-std::vector<glm::vec3> prevAcceleration(7, glm::vec3(0.0f));  // 이전 가속도 저장
-std::vector<glm::vec3> prevVelocity(7, glm::vec3(0.0f));      // 이전 속도 저장
-std::vector<bool> isInitialized(7, false);                    // 초기화 상태
 
 
 /*! \brief Stream insertion operator overload for XsPortInfo */
@@ -531,253 +525,91 @@ int main(int argc, char* argv[])
 		std::cout << "\nMain loop. Press any key to quit\n" << std::endl;
 		std::cout << "Waiting for data available..." << std::endl;
 
+		// ───── (1) 준비부 ───────────
 		std::vector<XsQuaternion> quaternionData(mtwCallbacks.size()); // Room to store quaternion data for each MTW
 		std::vector<XsVector> accelerationData(mtwCallbacks.size());
-		//unsigned int printCounter = 0;
+		unsigned int printCounter = 0;
+		
+		const double dtFixed = 1.0 / newUpdateRate;            // 75 Hz = 0.0133 s ★★★
+		const glm::vec3 g(0.0f, 0.0f, 9.81f);                  // 중력벡터 (world) ★★★
 
-		// ───── (1) 준비부 ─────────────────────────────────────────────────────
-		//const double dtFixed = 1.0 / newUpdateRate;            // 75 Hz = 0.0133 s ★★★
-		//const glm::vec3 g(0.0f, 0.0f, 9.81f);                  // 중력벡터 (world) ★★★
-
-		//// 센서마다 속도·위치 초기화 ★★★
-		//std::vector<glm::vec3> vel(mtwCallbacks.size(), glm::vec3(0.0f));
-		//std::vector<glm::vec3> pos(mtwCallbacks.size(), glm::vec3(0.0f));
-		//constexpr size_t POS_SENSOR = 0;
-
-		//while (!_kbhit()) {
-		//	XsTime::msleep(0);
-
-		//	bool newData = false;
-
-		//	// 1) 최신 패킷 수집
-		//	for (size_t i = 0; i < mtwCallbacks.size(); ++i) {
-		//		if (!mtwCallbacks[i]->dataAvailable()) continue;
-		//		newData = true;
-		//		const XsDataPacket* packet = mtwCallbacks[i]->getLatestPacket();
-
-		//		quaternionData[i] = packet->orientationQuaternion();
-		//		//accelerationData[i] = packet->calibratedAcceleration();
-		//		accelerationData[i] = packet->freeAcceleration();
-
-		//		mtwCallbacks[i]->clearPackets();
-		//	}
-
-		//	if (newData) {
-		//			size_t i = POS_SENSOR;
-		//			glm::vec3 accW(accelerationData[0], accelerationData[1], accelerationData[2]);
-
-		//			// ZUPT
-		//			if (glm::length(accW) < 0.2f)
-		//				vel[i] = glm::vec3(0.0f);
-
-		//			pos[i] += vel[i] * static_cast<float>(dtFixed);
-		//		}
-
-		//		// 나머지 센서는 위치 0으로(또는 이전 값 유지하고 싶으면 이 블록 삭제)
-		//		for (size_t i = 0; i < mtwCallbacks.size(); ++i) {
-		//			if (i == POS_SENSOR) continue;
-		//			pos[i] = glm::vec3(0.0f);
-		//		}
-		//		if ((frame % PRINT_EVERY) == 0) {
-		//			for (size_t i = 0; i < quaternionData.size(); ++i)
-		//				debugPrintPose(i, quaternionData[i], pos[i]);
-		//		}
-		//		frame++;
-
-		//		// 5) 송신 (논블로킹, 버퍼 꽉 차면 프레임 드롭하고 계속)
-		//		sendPoseData(sock, quaternionData, pos);
-		//	}
-
-		// while문 전 준비
+		// 센서마다 속도·위치 초기화 ★★★
 		std::vector<glm::vec3> vel(mtwCallbacks.size(), glm::vec3(0.0f));
 		std::vector<glm::vec3> pos(mtwCallbacks.size(), glm::vec3(0.0f));
-		std::vector<glm::vec3> prevAcc(mtwCallbacks.size(), glm::vec3(0.0f));
-		std::vector<std::chrono::steady_clock::time_point> lastTime(mtwCallbacks.size());
-		std::vector<bool> isInitialized(mtwCallbacks.size(), false);
-
 		constexpr size_t POS_SENSOR = 0;
-		constexpr unsigned PRINT_EVERY = 1000;
-		unsigned long frame = 0;
 
 		while (!_kbhit()) {
 			XsTime::msleep(0);
-
-
 
 			bool newData = false;
 
 			// 1) 최신 패킷 수집
 			for (size_t i = 0; i < mtwCallbacks.size(); ++i) {
 				if (!mtwCallbacks[i]->dataAvailable()) continue;
-
 				newData = true;
 				const XsDataPacket* packet = mtwCallbacks[i]->getLatestPacket();
+
 				quaternionData[i] = packet->orientationQuaternion();
-				accelerationData[i] = packet->freeAcceleration();  // 이미 월드 좌표계
+				accelerationData[i] = packet->freeAcceleration();
+
 				mtwCallbacks[i]->clearPackets();
-			}
-			constexpr size_t PELVIS_INDEX = 0;
-			unsigned long frame = 0;
-
-			// 통계를 위한 변수들
-			float maxAccMag = 0.0f;
-			float sumAccMag = 0.0f;
-			unsigned long validFrames = 0;
-
-			if (mtwCallbacks[PELVIS_INDEX]->dataAvailable()) {
-				const XsDataPacket* packet = mtwCallbacks[PELVIS_INDEX]->getLatestPacket();
-
-				// 두 종류 가속도 모두 확인
-				XsVector freeAcc = packet->freeAcceleration();
-				XsVector calibAcc = packet->calibratedAcceleration();
-
-				// 크기 계산
-				float freeMag = sqrt(freeAcc[0] * freeAcc[0] +
-					freeAcc[1] * freeAcc[1] +
-					freeAcc[2] * freeAcc[2]);
-
-				float calibMag = sqrt(calibAcc[0] * calibAcc[0] +
-					calibAcc[1] * calibAcc[1] +
-					calibAcc[2] * calibAcc[2]);
-
-				// 통계 업데이트
-				if (freeMag > maxAccMag) maxAccMag = freeMag;
-				sumAccMag += freeMag;
-				validFrames++;
-
-				// 매 100 프레임마다 출력
-				if (frame % 100 == 0) {
-					std::cout << std::fixed << std::setprecision(3);
-					std::cout << "Frame " << frame << ":\n";
-					std::cout << "  FreeAcc:  [" << std::setw(7) << freeAcc[0]
-						<< ", " << std::setw(7) << freeAcc[1]
-						<< ", " << std::setw(7) << freeAcc[2]
-						<< "] |Mag|=" << std::setw(6) << freeMag << " m/s²\n";
-					std::cout << "  CalibAcc: [" << std::setw(7) << calibAcc[0]
-						<< ", " << std::setw(7) << calibAcc[1]
-						<< ", " << std::setw(7) << calibAcc[2]
-						<< "] |Mag|=" << std::setw(6) << calibMag << " m/s²\n";
-
-					// 움직임 상태 판단
-					if (freeMag < 0.1f) {
-						std::cout << "  Status: STILL (no motion detected)\n";
-					}
-					else if (freeMag < 0.5f) {
-						std::cout << "  Status: SLIGHT movement\n";
-					}
-					else if (freeMag < 2.0f) {
-						std::cout << "  Status: MODERATE movement\n";
-					}
-					else {
-						std::cout << "  Status: STRONG movement\n";
-					}
-				}
 			}
 
 			if (newData) {
-				auto currentTime = std::chrono::steady_clock::now();
+				// POS_SENSOR 인덱스의 센서에 대해서만 위치 계산
+				if (POS_SENSOR < accelerationData.size()) {
+					// XsVector를 glm::vec3로 올바르게 변환
+					glm::vec3 accW(
+						static_cast<float>(accelerationData[POS_SENSOR][0]),
+						static_cast<float>(accelerationData[POS_SENSOR][1]),
+						static_cast<float>(accelerationData[POS_SENSOR][2])
+					);
 
-				// 2) 위치 추정 (센서 0번만)
-				size_t i = POS_SENSOR;
-
-				// 초기화 체크
-				if (!isInitialized[i]) {
-					lastTime[i] = currentTime;
-					isInitialized[i] = true;
-					prevAcc[i] = glm::vec3(0.0f);
-					continue;
-				}
-
-				// 실제 dt 계산
-				double dt = std::chrono::duration<double>(currentTime - lastTime[i]).count();
-				lastTime[i] = currentTime;
-
-				// dt 검증 (1ms ~ 100ms 범위)
-				if (dt < 0.001 || dt > 0.1) {
-					//std::cout << "Warning: abnormal dt = " << dt << " seconds, skipping frame" << std::endl;
-					continue;
-				}
-
-				// freeAcceleration은 이미 월드 좌표계이므로 직접 사용
-				XsVector acc = accelerationData[i];
-
-				float PrintaccMag = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
-				//std::cout << "Acc magnitude: " << PrintaccMag << " m/s²" << std::endl;
-			
-				glm::vec3 accLin(acc[0], acc[1], acc[2]);  // 중력 이미 제거됨
-
-				// 트래피조이드 적분 (더 정확)
-				glm::vec3 avgAcc = (accLin + prevAcc[i]) * 0.5f;
-				vel[i] += avgAcc * static_cast<float>(dt);
-				prevAcc[i] = accLin;
-
-				// 다단계 ZUPT 시스템
-				float accMag = glm::length(accLin);
-
-				// 1. 완전 정지 감지 (가장 엄격)
-				if (accMag < 0.15f) {
-					// 거의 움직임이 없음 - 강한 보정
-					vel[i] *= 0.8f;  // 20% 감속
-					if (glm::length(vel[i]) < 0.02f) {
-						vel[i] = glm::vec3(0.0f);  // 완전 정지
+					// ZUPT (Zero Velocity Update)
+					if (glm::length(accW) < 0.2f) {
+						vel[POS_SENSOR] = glm::vec3(0.0f);
 					}
+					else {
+						// 가속도 적분으로 속도 업데이트
+						vel[POS_SENSOR] += accW * static_cast<float>(dtFixed);
+					}
+
+					// 속도 적분으로 위치 업데이트
+					pos[POS_SENSOR] += vel[POS_SENSOR] * static_cast<float>(dtFixed);
 				}
-				// 2. 준정지 상태 (발이 지면에 닿는 순간)
-				else if (accMag < 0.4f) {
-					// 발이 지면에 있을 가능성 - 약한 보정
-					float velMag = glm::length(vel[i]);
-					if (velMag < 0.1f) {  // 속도가 낮을 때만
-						vel[i] *= 0.95f;   // 5% 감속
+
+				// 나머지 센서들의 위치는 0으로 설정
+				for (size_t i = 0; i < pos.size(); ++i) {
+					if (i != POS_SENSOR) {
+						pos[i] = glm::vec3(0.0f);
 					}
 				}
 
-
-				// 위치 적분
-				pos[i] += vel[i] * static_cast<float>(dt);
-
-				// 3) 나머지 센서 위치 (0으로 유지)
-				for (size_t j = 0; j < mtwCallbacks.size(); ++j) {
-					if (j != POS_SENSOR) pos[j] = glm::vec3(0.0f);
-				}
-
-				// 4) 디버그 출력
-				if ((frame % PRINT_EVERY) == 0) {
-					//std::cout << "dt: " << std::fixed << std::setprecision(4) << dt << "s, ";
-					for (size_t j = 0; j < quaternionData.size(); ++j) {
-						//debugPrintPose(j, quaternionData[j], pos[j]);
-					}
-					//std::cout << "Vel[0]: (" << vel[0].x << "," << vel[0].y << "," << vel[0].z << ")\n";
-				}
-				frame++;
-
-				// 5) 데이터 전송
+				// 5) 송신 (논블로킹, 버퍼 꽉 차면 프레임 드롭하고 계속)
 				sendPoseData(sock, quaternionData, pos);
 			}
 		}
-
-		
 			
+		// ───── 루프 종료 후 정리(여기서만 종료) ─────────────────────────────
+		std::cout << "Stopping measurement..." << std::endl;
 
-
-			// ───── 루프 종료 후 정리(여기서만 종료) ─────────────────────────────
-			std::cout << "Stopping measurement..." << std::endl;
-
-			std::cout << "Setting config mode..." << std::endl;
-			if (!wirelessMasterDevice->gotoConfig()) {
-				std::ostringstream error;
-				error << "Failed to goto config mode: " << *wirelessMasterDevice;
-				throw std::runtime_error(error.str());
-			}
-
-			std::cout << "Disabling radio... " << std::endl;
-			if (!wirelessMasterDevice->disableRadio()) {
-				std::ostringstream error;
-				error << "Failed to disable radio: " << *wirelessMasterDevice;
-				throw std::runtime_error(error.str());
-			}
-			closesocket(sock);
-			WSACleanup();
+		std::cout << "Setting config mode..." << std::endl;
+		if (!wirelessMasterDevice->gotoConfig()) {
+			std::ostringstream error;
+			error << "Failed to goto config mode: " << *wirelessMasterDevice;
+			throw std::runtime_error(error.str());
 		}
+
+		std::cout << "Disabling radio... " << std::endl;
+		if (!wirelessMasterDevice->disableRadio()) {
+			std::ostringstream error;
+			error << "Failed to disable radio: " << *wirelessMasterDevice;
+			throw std::runtime_error(error.str());
+		}
+		closesocket(sock);
+		WSACleanup();
+		}
+
 	catch (std::exception const& ex)
 		{
 			std::cout << ex.what() << std::endl;
