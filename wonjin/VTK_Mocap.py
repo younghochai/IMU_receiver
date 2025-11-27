@@ -3,6 +3,7 @@ from vtkmodules.vtkRenderingCore import (
     vtkRenderWindowInteractor,
     vtkRenderer,
 )
+
 from vtk import vtkTransform
 from vtkmodules.vtkCommonColor import vtkNamedColors
 
