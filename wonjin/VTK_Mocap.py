@@ -4,6 +4,7 @@ from vtkmodules.vtkRenderingCore import (
     vtkRenderer,
 
 )
+
 from vtk import vtkTransform
 from vtkmodules.vtkCommonColor import vtkNamedColors
 
