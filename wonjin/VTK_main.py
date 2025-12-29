@@ -15,10 +15,7 @@ from src.utils import (
     make_mapper_actor,
 )
 
-from src.data import (
-    start_data_thread,
-    keypress_callback
-)
+from src.data import start_data_thread, keypress_callback
 
 
 def main():
@@ -124,12 +121,18 @@ def main():
 
     for actor in [
         lower_body_actor,
-        left_pelvis_actor, right_pelvis_actor,
-        left_leg_actor, right_leg_actor,
-        left_knee_actor, right_knee_actor,
-        left_calf_actor, right_calf_actor,
-        left_ankle_actor, right_ankle_actor,
-        left_foot_actor, right_foot_actor,
+        left_pelvis_actor,
+        right_pelvis_actor,
+        left_leg_actor,
+        right_leg_actor,
+        left_knee_actor,
+        right_knee_actor,
+        left_calf_actor,
+        right_calf_actor,
+        left_ankle_actor,
+        right_ankle_actor,
+        left_foot_actor,
+        right_foot_actor,
     ]:
         renderer.AddActor(actor)
 
