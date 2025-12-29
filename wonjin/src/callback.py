@@ -54,7 +54,7 @@ class TimerCallback:
                 w6, x6, y6, z6,
                 w7, x7, y7, z7
             ])
-        # w, x, y, z = latest_quat[self.sensor_idx]
+
         raw_w, raw_x, raw_y, raw_z = latest_quat[self.sensor_idx]
         calib_w, calib_x, calib_y, calib_z = calibration_offsets[self.sensor_idx]
 
