@@ -1,82 +1,37 @@
-import time
-import argparse
-
-import pandas as pd
-
-from vtkmodules.vtkCommonColor import vtkNamedColors
 from vtkmodules.vtkRenderingCore import (
     vtkRenderWindow,
     vtkRenderWindowInteractor,
     vtkRenderer,
 )
-from vtk import vtkTransform, vtkMatrix4x4
+from vtk import vtkTransform
+from vtkmodules.vtkCommonColor import vtkNamedColors
+
+from src.callback import TimerCallback
 
 from src.utils import (
     make_cube_source,
     make_sphere_source,
     make_cylinder_source,
     make_mapper_actor,
-    quat_to_matrix,
 )
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--path", help="csv경로")
-args = parser.parse_args()
+from src.data import start_data_thread, keypress_callback
 
 
-class CSVReplayCallback:
-    def __init__(
-        self, df, actor, transform, position, render_window, sensor_idx, start_time=None
-    ):
-        self.df = df
-        self.actor = actor
-        self.transform = transform
-        self.pos = position
-        self.sensor_idx = sensor_idx
-        self.renWin = render_window
-        self.index = 0
-        self.start_time = start_time if start_time else time.time()
-        self.timestamp0 = df.iloc[0]["timestamp"]
+def main():
+    start_data_thread()
 
-        self.B = vtkMatrix4x4()
-        self.B.DeepCopy((0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1))
-        self.B_inv = vtkMatrix4x4()
-        vtkMatrix4x4.Invert(self.B, self.B_inv)
-
-        print(f"Read CSV, sensor{self.sensor_idx+1}")
-
-    def __call__(self, obj, event):
-        if self.index >= len(self.df):
-            print("END")
-            return  # 끝남
-
-        current_df = self.df.iloc[self.index]
-        prefix = f"sensor{self.sensor_idx+1}_"
-        w = current_df[f"{prefix}w"]
-        x = current_df[f"{prefix}x"]
-        y = current_df[f"{prefix}y"]
-        z = current_df[f"{prefix}z"]
-
-        Mq = vtkMatrix4x4()
-        Mq.DeepCopy(quat_to_matrix(w, x, y, z))
-
-        tmp = vtkMatrix4x4()
-        vtkMatrix4x4.Multiply4x4(self.B, Mq, tmp)
-        Mprime = vtkMatrix4x4()
-        vtkMatrix4x4.Multiply4x4(tmp, self.B_inv, Mprime)
-
-        self.transform.SetMatrix(Mprime)
-        self.transform.Translate(0, self.pos, 0)
-        self.actor.SetUserTransform(self.transform)
-        self.renWin.Render()
-
-        self.index += 1
-
-
-def main(data_path):
-    df = pd.read_csv(f"Recorded_Data/{data_path}")
-    print(df.shape)
     colors = vtkNamedColors()
+
+    renderer = vtkRenderer()
+    renderer.SetBackground(colors.GetColor3d("White"))
+
+    render_win = vtkRenderWindow()
+    render_win.SetWindowName("ROBOT 7ea Sensors")
+    render_win.SetSize(600, 800)
+    render_win.AddRenderer(renderer)
+
+    ren_win_interactor = vtkRenderWindowInteractor()
 
     lower_body_source = make_cylinder_source(11, 9)
     left_pelvis_source = make_sphere_source(4.7)
@@ -104,13 +59,12 @@ def main(data_path):
     # 골반
     left_pelvis_transform = vtkTransform()
     left_pelvis_transform.Translate(-5, -5, 0)
-    left_pelvis_transform.SetInput(lower_body_transform)
     left_pelvis_actor = make_mapper_actor(left_pelvis_source, left_pelvis_transform)
 
     right_pelvis_transform = vtkTransform()
     right_pelvis_transform.Translate(5, -5, 0)
-    right_pelvis_transform.SetInput(lower_body_transform)
     right_pelvis_actor = make_mapper_actor(right_pelvis_source, right_pelvis_transform)
+
     # 허벅지
     left_leg_transform = vtkTransform()
     left_leg_transform.Translate(0, -10, 0)
@@ -139,7 +93,6 @@ def main(data_path):
     left_calf_actor = make_mapper_actor(left_calf_source, left_calf_transform)
 
     right_calf_transform = vtkTransform()
-    # right_calf_transform.Translate(0,-31,0)
     right_calf_transform.SetInput(right_knee_transform)
     right_calf_actor = make_mapper_actor(right_calf_source, right_calf_transform)
 
@@ -166,8 +119,6 @@ def main(data_path):
     right_foot_transform.SetInput(right_ankle_transform)
     right_foot_actor = make_mapper_actor(right_foot_source, right_foot_transform)
 
-    renderer = vtkRenderer()
-
     for actor in [
         lower_body_actor,
         left_pelvis_actor,
@@ -185,49 +136,40 @@ def main(data_path):
     ]:
         renderer.AddActor(actor)
 
-    renderer.SetBackground(colors.GetColor3d("White"))
-
-    render_win = vtkRenderWindow()
-    render_win.SetWindowName("REPLAY - READ_CSV")
-    render_win.SetSize(600, 800)
-    render_win.AddRenderer(renderer)
-
-    ren_win_interactor = vtkRenderWindowInteractor()
-    ren_win_interactor.SetRenderWindow(render_win)
-
+    pelvis_cb = TimerCallback(
+        lower_body_actor, lower_body_transform, 0, 0, render_win, 0
+    )
     # 왼쪽
-    lower_body_replaycb = CSVReplayCallback(
-        df, lower_body_actor, lower_body_transform, 0, render_win, 0
+    left_leg_cb = TimerCallback(
+        left_leg_actor, left_leg_transform, 0, -11, render_win, 1
     )
-    left_leg_replaycb = CSVReplayCallback(
-        df, left_leg_actor, left_leg_transform, -11, render_win, 1
+    left_calf_cb = TimerCallback(
+        left_calf_actor, left_calf_transform, 0, -10, render_win, 2
     )
-    left_calf_replaycb = CSVReplayCallback(
-        df, left_calf_actor, left_calf_transform, -10, render_win, 2
-    )
-    left_foot_replaycb = CSVReplayCallback(
-        df, left_foot_actor, left_foot_transform, -4, render_win, 3
+    left_foot_cb = TimerCallback(
+        left_foot_actor, left_foot_transform, 0, -4, render_win, 3
     )
     # 오른쪽
-    right_leg_replaycb = CSVReplayCallback(
-        df, right_leg_actor, right_leg_transform, -11, render_win, 4
+    right_leg_cb = TimerCallback(
+        right_leg_actor, right_leg_transform, 0, -11, render_win, 4
     )
-    right_calf_replaycb = CSVReplayCallback(
-        df, right_calf_actor, right_calf_transform, -10, render_win, 5
+    right_calf_cb = TimerCallback(
+        right_calf_actor, right_calf_transform, 0, -10, render_win, 5
     )
-    right_foot_replaycb = CSVReplayCallback(
-        df, right_foot_actor, right_foot_transform, -4, render_win, 6
+    right_foot_cb = TimerCallback(
+        right_foot_actor, right_foot_transform, 0, -4, render_win, 6
     )
 
-    ren_win_interactor.AddObserver("TimerEvent", lower_body_replaycb)
-    ren_win_interactor.AddObserver("TimerEvent", left_leg_replaycb)
-    ren_win_interactor.AddObserver("TimerEvent", left_calf_replaycb)
-    ren_win_interactor.AddObserver("TimerEvent", left_foot_replaycb)
-    ren_win_interactor.AddObserver("TimerEvent", right_leg_replaycb)
-    ren_win_interactor.AddObserver("TimerEvent", right_calf_replaycb)
-    ren_win_interactor.AddObserver("TimerEvent", right_foot_replaycb)
-    # ren_win_interactor.AddObserver("KeyPressEvent", keypress_callback)
+    ren_win_interactor.AddObserver("TimerEvent", pelvis_cb)
+    ren_win_interactor.AddObserver("TimerEvent", left_leg_cb)
+    ren_win_interactor.AddObserver("TimerEvent", left_calf_cb)
+    ren_win_interactor.AddObserver("TimerEvent", left_foot_cb)
+    ren_win_interactor.AddObserver("TimerEvent", right_leg_cb)
+    ren_win_interactor.AddObserver("TimerEvent", right_calf_cb)
+    ren_win_interactor.AddObserver("TimerEvent", right_foot_cb)
+    ren_win_interactor.AddObserver("KeyPressEvent", keypress_callback)
 
+    ren_win_interactor.SetRenderWindow(render_win)
     ren_win_interactor.Initialize()
     ren_win_interactor.CreateRepeatingTimer(10)
 
@@ -236,5 +178,4 @@ def main(data_path):
 
 
 if __name__ == "__main__":
-    main(data_path=args.path)
-    # python read_csv.py --path {your_data}.csv
+    main()
