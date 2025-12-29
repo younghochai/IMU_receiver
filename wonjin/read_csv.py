@@ -7,7 +7,7 @@ from vtkmodules.vtkCommonColor import vtkNamedColors
 from vtkmodules.vtkRenderingCore import (
     vtkRenderWindow,
     vtkRenderWindowInteractor,
-    vtkRenderer
+    vtkRenderer,
 )
 from vtk import vtkTransform, vtkMatrix4x4
 
@@ -16,7 +16,7 @@ from src.utils import (
     make_sphere_source,
     make_cylinder_source,
     make_mapper_actor,
-    quat_to_matrix
+    quat_to_matrix,
 )
 
 parser = argparse.ArgumentParser()
@@ -25,7 +25,9 @@ args = parser.parse_args()
 
 
 class CSVReplayCallback:
-    def __init__(self, df, actor, transform, position, render_window, sensor_idx, start_time=None):
+    def __init__(
+        self, df, actor, transform, position, render_window, sensor_idx, start_time=None
+    ):
         self.df = df
         self.actor = actor
         self.transform = transform
@@ -37,12 +39,7 @@ class CSVReplayCallback:
         self.timestamp0 = df.iloc[0]["timestamp"]
 
         self.B = vtkMatrix4x4()
-        self.B.DeepCopy((
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            1, 0, 0, 0,
-            0, 0, 0, 1
-        ))
+        self.B.DeepCopy((0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1))
         self.B_inv = vtkMatrix4x4()
         vtkMatrix4x4.Invert(self.B, self.B_inv)
 
@@ -50,7 +47,7 @@ class CSVReplayCallback:
 
     def __call__(self, obj, event):
         if self.index >= len(self.df):
-            print('END')
+            print("END")
             return  # 끝남
 
         current_df = self.df.iloc[self.index]
@@ -173,12 +170,18 @@ def main(data_path):
 
     for actor in [
         lower_body_actor,
-        left_pelvis_actor, right_pelvis_actor,
-        left_leg_actor, right_leg_actor,
-        left_knee_actor, right_knee_actor,
-        left_calf_actor, right_calf_actor,
-        left_ankle_actor, right_ankle_actor,
-        left_foot_actor, right_foot_actor,
+        left_pelvis_actor,
+        right_pelvis_actor,
+        left_leg_actor,
+        right_leg_actor,
+        left_knee_actor,
+        right_knee_actor,
+        left_calf_actor,
+        right_calf_actor,
+        left_ankle_actor,
+        right_ankle_actor,
+        left_foot_actor,
+        right_foot_actor,
     ]:
         renderer.AddActor(actor)
 
@@ -205,7 +208,7 @@ def main(data_path):
     left_foot_replaycb = CSVReplayCallback(
         df, left_foot_actor, left_foot_transform, -4, render_win, 3
     )
-    # 오른쪽 
+    # 오른쪽
     right_leg_replaycb = CSVReplayCallback(
         df, right_leg_actor, right_leg_transform, -11, render_win, 4
     )
